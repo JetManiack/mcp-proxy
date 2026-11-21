@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/JetManiack/mcp-proxy/internal/mcpclient"
@@ -212,6 +213,56 @@ func TestMCPToolCall(t *testing.T) {
 	text := res.Content[0].(*mcp.TextContent).Text
 	if text != "proxy works" {
 		t.Errorf("mcp_tool_call: got %q, want %q", text, "proxy works")
+	}
+}
+
+// TestMCPToolCall_ProxyToolRejected checks that calling a proxy-level tool via
+// mcp_tool_call returns a clear error instead of forwarding to an upstream.
+// This prevents agents from looping when they accidentally route proxy tools
+// through mcp_tool_call with an upstream_id.
+// No database needed: the proxy-tool guard fires before any pool/store call.
+func TestMCPToolCall_ProxyToolRejected(t *testing.T) {
+	ctx := context.Background()
+
+	pool := mcpclient.NewPool(nil, make([]byte, 32), nil, nil)
+	t.Cleanup(pool.Close)
+
+	proxySrv := mcpserver.New(pool)
+	sess := connectProxyClient(t, proxySrv.Handler(), uuid.Nil)
+
+	proxyTools := []string{
+		"upstream_status",
+		"mcp_tool_search",
+		"mcp_tool_call",
+		"mcp_resource_list",
+		"mcp_resource_read",
+	}
+	for _, toolName := range proxyTools {
+		t.Run(toolName, func(t *testing.T) {
+			res, err := sess.CallTool(ctx, &mcp.CallToolParams{
+				Name: "mcp_tool_call",
+				Arguments: map[string]any{
+					"upstream_id": uuid.New().String(),
+					"tool_name":   toolName,
+					"args":        map[string]any{},
+				},
+			})
+			if err != nil {
+				t.Fatalf("unexpected protocol error: %v", err)
+			}
+			if !res.IsError {
+				t.Fatalf("expected IsError=true for proxy tool %q routed via mcp_tool_call", toolName)
+			}
+			if len(res.Content) == 0 {
+				t.Fatal("expected non-empty error content")
+			}
+			msg := res.Content[0].(*mcp.TextContent).Text
+			// The error must guide the agent: explain this is a proxy tool and
+			// must be called directly, not routed through mcp_tool_call.
+			if !strings.Contains(msg, "proxy") {
+				t.Errorf("error message must mention 'proxy' to guide the agent; got: %q", msg)
+			}
+		})
 	}
 }
 
