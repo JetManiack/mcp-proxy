@@ -411,7 +411,7 @@ func (p *Pool) UpstreamStatuses(ctx context.Context, userID uuid.UUID) ([]*Upstr
 		}
 
 		if up.AuthType == "oauth2_authorization_code" {
-			tok, err := p.store.GetUserToken(ctx, up.ID, userID)
+			tok, err := p.store.GetUserToken(ctx, up.ID, uuid.Nil)
 			if err != nil || tok.Status != "authorized" {
 				st.Status = "needs_auth"
 				out = append(out, st)
@@ -444,19 +444,17 @@ func (p *Pool) getSession(ctx context.Context, up *store.Upstream, userID uuid.U
 
 	switch up.AuthType {
 	case "oauth2_authorization_code":
-		key = sessionKey{upstreamID: up.ID, userID: userID}
-		// uuid.Nil means catalog/discovery context — connect without credentials so
-		// all oauth2 upstreams appear in mcp_tool_search regardless of auth state.
-		// A real user's token is required only when userID is set (CallTool path).
-		if p.manager != nil && userID != uuid.Nil {
-			tok, err := p.store.GetUserToken(ctx, up.ID, userID)
-			if err != nil {
-				return nil, fmt.Errorf("get user token: %w", err)
+		// OAuth2 tokens are shared — one authorization covers all callers.
+		// The caller's userID is irrelevant; always use uuid.Nil as the session key.
+		key = sessionKey{upstreamID: up.ID, userID: uuid.Nil}
+		if p.manager != nil {
+			tok, err := p.store.GetUserToken(ctx, up.ID, uuid.Nil)
+			if err == nil && tok.Status == "authorized" {
+				tokenHash = sha256.Sum256(tok.AccessToken)
 			}
-			if tok.Status != "authorized" {
-				return nil, fmt.Errorf("token status %q for upstream %s", tok.Status, up.ID)
-			}
-			tokenHash = sha256.Sum256(tok.AccessToken)
+			// No shared token yet: fall through and connect unauthenticated.
+			// Tool listings may still work; actual calls will fail with an auth
+			// error from the upstream if credentials are required.
 		}
 	case "bearer_static":
 		cred, err := p.store.GetCredential(ctx, up.ID)
@@ -507,14 +505,13 @@ func (p *Pool) getSession(ctx context.Context, up *store.Upstream, userID uuid.U
 	// For oauth2 upstreams attach the OAuthHandler from the manager so the
 	// transport uses the persisting token source (auto-refresh included).
 	var oauthHandler sdkauth.OAuthHandler
-	if up.AuthType == "oauth2_authorization_code" && p.manager != nil && userID != uuid.Nil {
-		h, err := p.manager.SessionHandler(ctx, up, userID)
+	if up.AuthType == "oauth2_authorization_code" && p.manager != nil {
+		h, err := p.manager.SessionHandler(ctx, up, uuid.Nil)
 		if err != nil {
 			return nil, fmt.Errorf("build session oauth handler: %w", err)
 		}
-		if h == nil {
-			return nil, fmt.Errorf("no authorized token for upstream %s", up.ID)
-		}
+		// h may be nil when no shared token exists; oauthHandler stays nil and
+		// the connection proceeds unauthenticated.
 		oauthHandler = h
 	}
 

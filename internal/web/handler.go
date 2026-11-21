@@ -293,12 +293,9 @@ func (h *Handler) beginAuth(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	user, err := currentUser(r, h.store)
-	if err != nil {
-		httpError(w, fmt.Errorf("identify user: %w", err), http.StatusUnauthorized)
-		return
-	}
-	redirectURL, _, err := h.oauth.BeginAuth(r.Context(), up.ID, user.ID)
+	// OAuth2 tokens are shared — the authorizing user's identity doesn't matter,
+	// the resulting token covers all agents.
+	redirectURL, _, err := h.oauth.BeginAuth(r.Context(), up.ID, uuid.Nil)
 	if err != nil {
 		httpError(w, fmt.Errorf("begin auth: %w", err), http.StatusInternalServerError)
 		return
