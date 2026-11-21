@@ -110,6 +110,11 @@ func main() {
 				Value:   "X-Auth-Request-Groups",
 				Sources: cli.EnvVars("MCP_PROXY_HEADER_GROUPS"),
 			},
+			&cli.BoolFlag{
+				Name:    "direct-tools",
+				Usage:   "expose upstream tools directly in tools/list instead of routing through mcp_tool_search / mcp_tool_call; note: per-user OAuth2 upstreams are not included in the direct tool list",
+				Sources: cli.EnvVars("MCP_PROXY_DIRECT_TOOLS"),
+			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			telemetry.Setup(cmd.String("log-format"))
@@ -166,6 +171,10 @@ func buildConfig(cmd *cli.Command) (*config.Config, error) {
 		cfg.EncryptionKey = key
 	}
 
+	if cmd.IsSet("direct-tools") {
+		cfg.DirectTools = cmd.Bool("direct-tools")
+	}
+
 	return cfg, config.Validate(cfg)
 }
 
@@ -188,13 +197,15 @@ func run(cfg *config.Config) error {
 	pool := mcpclient.NewPool(s, cfg.EncryptionKey, nil, oauthMgr)
 	defer pool.Close()
 
-	// Start background loops.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	pool.StartReconcileLoop(ctx, registry)
 
-	// MCP server for agents.
-	mcpSrv := mcpserver.New(pool)
+	// MCP server for agents — must be created before StartReconcileLoop so that
+	// the catalog-change hook is registered before the first reconcile fires.
+	mcpSrv := mcpserver.New(pool, cfg.DirectTools)
+
+	// Start background loops.
+	pool.StartReconcileLoop(ctx, registry)
 
 	// Web UI handler.
 	webHandler := web.New(s, registry, oauthMgr, pool)

@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/JetManiack/mcp-proxy/internal/mcpclient"
 	"github.com/JetManiack/mcp-proxy/internal/mcpserver"
@@ -74,6 +75,197 @@ func connectProxyClient(t *testing.T, proxyHandler http.Handler, userID uuid.UUI
 	return sess
 }
 
+// --- direct-tools mode tests --------------------------------------------------
+
+// noopDiscoverer satisfies mcpclient.Discoverer for test reconcile loops that
+// only deal with non-OAuth2 upstreams (Discover is never called).
+type noopDiscoverer struct{}
+
+func (noopDiscoverer) Discover(_ context.Context, _ uuid.UUID) error { return nil }
+
+// TestDirectTools_Listed verifies that upstream tools appear in tools/list when
+// direct-tools mode is enabled. Tools whose name does not already start with the
+// upstream name get prefixed as "upstream__tool"; others are kept as-is.
+func TestDirectTools_Listed(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	hs := newMockUpstream(t)
+	upName := "dt-listed-" + uuid.New().String()[:8]
+	up := &store.Upstream{Name: upName, URL: hs.URL, AuthType: "none"}
+	if err := s.CreateUpstream(ctx, up); err != nil {
+		t.Fatalf("CreateUpstream: %v", err)
+	}
+	t.Cleanup(func() { _ = s.DeleteUpstream(ctx, up.ID) })
+
+	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
+	t.Cleanup(pool.Close)
+
+	proxySrv := mcpserver.New(pool, true) // direct-tools mode
+	sess := connectProxyClient(t, proxySrv.Handler(), uuid.Nil)
+
+	res, err := sess.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("tools/list: %v", err)
+	}
+
+	names := make(map[string]bool, len(res.Tools))
+	for _, tool := range res.Tools {
+		names[tool.Name] = true
+	}
+
+	// "echo" does not start with "<upName>_", so it should be namespaced
+	expectedNS := upName + "__echo"
+	if !names[expectedNS] {
+		t.Errorf("expected %s in tools/list; got: %v", expectedNS, res.Tools)
+	}
+	// meta-tools must still be present
+	if !names["upstream_status"] {
+		t.Errorf("expected upstream_status in tools/list; got: %v", res.Tools)
+	}
+	// search/call meta-tools must be absent in direct mode
+	if names["mcp_tool_search"] {
+		t.Error("mcp_tool_search must not appear in tools/list in direct mode")
+	}
+	if names["mcp_tool_call"] {
+		t.Error("mcp_tool_call must not appear in tools/list in direct mode")
+	}
+}
+
+// TestDirectTools_NamespacePrefix verifies that a tool whose name already starts
+// with "<upstream>_" is kept as-is (no double-prefix).
+func TestDirectTools_NamespacePrefix(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	// upName and tool name share the same prefix so namespaceTool returns toolName unchanged.
+	suffix := uuid.New().String()[:8]
+	upName := "vendor" + suffix
+	toolName := upName + "_greet" // already prefixed with upName+"_"
+
+	srv := mcp.NewServer(&mcp.Implementation{Name: "srv", Version: "v0"}, nil)
+	mcp.AddTool(srv, &mcp.Tool{Name: toolName, Description: "greet"},
+		func(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "hi"}}}, nil, nil
+		},
+	)
+	hs := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server { return srv }, nil))
+	t.Cleanup(hs.Close)
+
+	up := &store.Upstream{Name: upName, URL: hs.URL, AuthType: "none"}
+	if err := s.CreateUpstream(ctx, up); err != nil {
+		t.Fatalf("CreateUpstream: %v", err)
+	}
+	t.Cleanup(func() { _ = s.DeleteUpstream(ctx, up.ID) })
+
+	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
+	t.Cleanup(pool.Close)
+
+	proxySrv := mcpserver.New(pool, true)
+	sess := connectProxyClient(t, proxySrv.Handler(), uuid.Nil)
+
+	res, err := sess.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("tools/list: %v", err)
+	}
+	names := make(map[string]bool, len(res.Tools))
+	for _, tool := range res.Tools {
+		names[tool.Name] = true
+	}
+	if !names[toolName] {
+		t.Errorf("expected %s kept as-is; got: %v", toolName, res.Tools)
+	}
+	if names[upName+"__"+toolName] {
+		t.Errorf("%s must not be double-prefixed to %s", toolName, upName+"__"+toolName)
+	}
+}
+
+// TestDirectTools_Call verifies that a tool can be called by its namespaced name.
+func TestDirectTools_Call(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	hs := newMockUpstream(t)
+	upName := "dt-call-" + uuid.New().String()[:8]
+	up := &store.Upstream{Name: upName, URL: hs.URL, AuthType: "none"}
+	if err := s.CreateUpstream(ctx, up); err != nil {
+		t.Fatalf("CreateUpstream: %v", err)
+	}
+	t.Cleanup(func() { _ = s.DeleteUpstream(ctx, up.ID) })
+
+	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
+	t.Cleanup(pool.Close)
+
+	proxySrv := mcpserver.New(pool, true)
+	sess := connectProxyClient(t, proxySrv.Handler(), uuid.Nil)
+
+	nsName := upName + "__echo"
+	res, err := sess.CallTool(ctx, &mcp.CallToolParams{
+		Name:      nsName,
+		Arguments: map[string]any{"msg": "hello direct"},
+	})
+	if err != nil {
+		t.Fatalf("call %s: %v", nsName, err)
+	}
+	if res.IsError {
+		t.Fatalf("%s returned error: %v", nsName, res.Content)
+	}
+	if len(res.Content) == 0 {
+		t.Fatal("empty content")
+	}
+	if text := res.Content[0].(*mcp.TextContent).Text; text != "hello direct" {
+		t.Errorf("got %q, want %q", text, "hello direct")
+	}
+}
+
+// TestDirectTools_CatalogUpdate verifies that tools added after server creation
+// appear in tools/list once the pool reconcile loop fires its catalog-change hook.
+func TestDirectTools_CatalogUpdate(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
+	t.Cleanup(pool.Close)
+
+	// Create the server BEFORE starting the reconcile loop so the hook is
+	// registered before the first reconcile goroutine runs.
+	proxySrv := mcpserver.New(pool, true)
+
+	rCtx, cancel := context.WithCancel(ctx)
+	t.Cleanup(cancel)
+	pool.StartReconcileLoop(rCtx, noopDiscoverer{})
+
+	sess := connectProxyClient(t, proxySrv.Handler(), uuid.Nil)
+
+	// Add an upstream after the server and reconcile loop are running.
+	hs := newMockUpstream(t)
+	upName := "dt-update-" + uuid.New().String()[:8]
+	up := &store.Upstream{Name: upName, URL: hs.URL, AuthType: "none"}
+	if err := s.CreateUpstream(ctx, up); err != nil {
+		t.Fatalf("CreateUpstream: %v", err)
+	}
+	t.Cleanup(func() { _ = s.DeleteUpstream(ctx, up.ID) })
+
+	pool.TriggerReconcile()
+
+	expectedName := upName + "__echo"
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		res, err := sess.ListTools(ctx, nil)
+		if err == nil {
+			for _, tool := range res.Tools {
+				if tool.Name == expectedName {
+					return // found — test passes
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("tool %s not found in tools/list within 5s after catalog update", expectedName)
+}
+
+// --- search-mode tests --------------------------------------------------------
+
 func TestMCPToolSearch(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -92,7 +284,7 @@ func TestMCPToolSearch(t *testing.T) {
 	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
 	t.Cleanup(pool.Close)
 
-	proxySrv := mcpserver.New(pool)
+	proxySrv := mcpserver.New(pool, false)
 	sess := connectProxyClient(t, proxySrv.Handler(), uuid.Nil)
 
 	res, err := sess.CallTool(ctx, &mcp.CallToolParams{
@@ -140,7 +332,7 @@ func TestMCPToolSearch_IncludesInputSchema(t *testing.T) {
 	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
 	t.Cleanup(pool.Close)
 
-	proxySrv := mcpserver.New(pool)
+	proxySrv := mcpserver.New(pool, false)
 	sess := connectProxyClient(t, proxySrv.Handler(), uuid.Nil)
 
 	res, err := sess.CallTool(ctx, &mcp.CallToolParams{
@@ -193,7 +385,7 @@ func TestMCPToolCall(t *testing.T) {
 	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
 	t.Cleanup(pool.Close)
 
-	proxySrv := mcpserver.New(pool)
+	proxySrv := mcpserver.New(pool, false)
 	sess := connectProxyClient(t, proxySrv.Handler(), uuid.Nil)
 
 	res, err := sess.CallTool(ctx, &mcp.CallToolParams{
@@ -227,7 +419,7 @@ func TestMCPToolCall_ProxyToolRejected(t *testing.T) {
 	pool := mcpclient.NewPool(nil, make([]byte, 32), nil, nil)
 	t.Cleanup(pool.Close)
 
-	proxySrv := mcpserver.New(pool)
+	proxySrv := mcpserver.New(pool, false)
 	sess := connectProxyClient(t, proxySrv.Handler(), uuid.Nil)
 
 	proxyTools := []string{
@@ -273,7 +465,7 @@ func TestMCPToolCall_InvalidUpstreamID(t *testing.T) {
 	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
 	t.Cleanup(pool.Close)
 
-	proxySrv := mcpserver.New(pool)
+	proxySrv := mcpserver.New(pool, false)
 	sess := connectProxyClient(t, proxySrv.Handler(), uuid.Nil)
 
 	res, err := sess.CallTool(ctx, &mcp.CallToolParams{
@@ -309,7 +501,7 @@ func TestUpstreamStatus(t *testing.T) {
 	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
 	t.Cleanup(pool.Close)
 
-	proxySrv := mcpserver.New(pool)
+	proxySrv := mcpserver.New(pool, false)
 	sess := connectProxyClient(t, proxySrv.Handler(), uuid.Nil)
 
 	res, err := sess.CallTool(ctx, &mcp.CallToolParams{

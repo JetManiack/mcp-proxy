@@ -64,7 +64,7 @@ func TestE2E_ToolToggle(t *testing.T) {
 	pool := mcpclient.NewPool(s, encKey, nil, nil)
 	t.Cleanup(pool.Close)
 
-	proxySrv := mcpserver.New(pool)
+	proxySrv := mcpserver.New(pool, false)
 	proxyHandler := web.AgentTokenAuthHandler(s, proxySrv.Handler())
 	proxySrvHTTP := httptest.NewServer(proxyHandler)
 	t.Cleanup(proxySrvHTTP.Close)
