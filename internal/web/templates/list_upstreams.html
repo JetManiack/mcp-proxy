@@ -1,0 +1,76 @@
+{{define "content"}}
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Upstreams</h1>
+    <p class="page-desc">MCP servers this proxy routes tool calls to.</p>
+  </div>
+  <a href="/ui/upstreams/new" class="btn btn-primary">
+    <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M6.5 1v11M1 6.5h11" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/></svg>
+    Add upstream
+  </a>
+</div>
+
+<div class="card">
+  {{if .Upstreams}}
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>URL</th>
+          <th>Auth</th>
+          <th>Status</th>
+          <th style="text-align:right">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Upstreams}}
+        <tr>
+          <td class="td-name"><a href="/ui/upstreams/{{.ID}}">{{.Name}}</a></td>
+          <td class="td-mono">{{.URL}}</td>
+          <td>
+            {{if eq .AuthType "oauth2_authorization_code"}}
+              <span class="badge badge-oauth">OAuth 2.0</span>
+            {{else if eq .AuthType "bearer_static"}}
+              <span class="badge badge-bearer">Bearer</span>
+            {{else}}
+              <span class="badge badge-none">{{.AuthType}}</span>
+            {{end}}
+          </td>
+          <td>
+            {{if eq .Status "connected"}}
+              <span class="status-dot status-ok"></span><span class="status-label">Connected</span>
+            {{else if eq .Status "needs_auth"}}
+              <span class="status-dot status-warn"></span><span class="status-label">Needs auth</span>
+            {{else if eq .Status "pending_discovery"}}
+              <span class="status-dot status-warn"></span><span class="status-label">Discovering…</span>
+            {{else if eq .Status "unreachable"}}
+              <span class="status-dot status-err" title="{{.Error}}"></span><span class="status-label">Unreachable</span>
+            {{else}}
+              <span class="status-dot status-idle"></span><span class="status-label">Unknown</span>
+            {{end}}
+          </td>
+          <td class="td-actions">
+            <a href="/ui/upstreams/{{.ID}}" class="btn btn-ghost btn-sm">View</a>
+            <form method="POST" action="/ui/upstreams/{{.ID}}/delete" style="display:inline">
+              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+              <button class="btn btn-danger btn-sm" onclick="return confirm('Delete upstream {{.Name}} and all its tokens?')">Delete</button>
+            </form>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <div class="empty-state">
+    <div class="empty-icon">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M10 2.5L17.5 10L10 17.5L2.5 10L10 2.5Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M10 6.5L13.5 10L10 13.5L6.5 10L10 6.5Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+    </div>
+    <div class="empty-title">No upstreams yet</div>
+    <p class="empty-desc">Add an MCP server to start routing tool calls through this proxy.</p>
+    <a href="/ui/upstreams/new" class="btn btn-primary">Add first upstream</a>
+  </div>
+  {{end}}
+</div>
+{{end}}

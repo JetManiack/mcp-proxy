@@ -1,0 +1,58 @@
+{{define "content"}}
+<a href="/ui/upstreams" class="back-link">
+  <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M9 2L4 7l5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  Upstreams
+</a>
+
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Add upstream</h1>
+    <p class="page-desc">Connect a new MCP server to this proxy.</p>
+  </div>
+</div>
+
+<div class="card" style="max-width:520px">
+  <div class="card-body">
+    <form method="POST" action="/ui/upstreams">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <div class="form-row">
+        <label for="name">Name</label>
+        <input type="text" id="name" name="name" required placeholder="e.g. github-tools" autocomplete="off">
+        <span class="form-hint">A short, memorable name for this upstream.</span>
+      </div>
+      <div class="form-row">
+        <label for="url">URL</label>
+        <input type="url" id="url" name="url" required placeholder="https://…/mcp" autocomplete="off">
+        <span class="form-hint">The MCP server's base URL (StreamableHTTP endpoint).</span>
+      </div>
+      <div class="form-row">
+        <label for="auth_type">Auth type</label>
+        <select id="auth_type" name="auth_type" onchange="toggleToken(this.value)">
+          <option value="auto" selected>Auto-detect (recommended)</option>
+          <option value="none">None — no authentication</option>
+          <option value="bearer_static">Bearer token — static key</option>
+          <option value="oauth2_authorization_code">OAuth 2.0 Authorization Code + PKCE</option>
+        </select>
+        <span class="form-hint">Auto-detect probes the server and reads its <code>WWW-Authenticate</code> header.</span>
+      </div>
+      <div class="form-row" id="token-row" hidden>
+        <label for="static_token">Bearer token</label>
+        <input type="password" id="static_token" name="static_token" placeholder="sk-…" autocomplete="new-password" spellcheck="false">
+        <span class="form-hint">Stored encrypted at rest. Sent as <code>Authorization: Bearer …</code> on every request.</span>
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Create upstream</button>
+        <a href="/ui/upstreams" class="btn btn-ghost">Cancel</a>
+      </div>
+    </form>
+  </div>
+</div>
+<script>
+function toggleToken(v) {
+  var row = document.getElementById('token-row');
+  var inp = document.getElementById('static_token');
+  row.hidden = v !== 'bearer_static';
+  inp.required = v === 'bearer_static';
+}
+</script>
+{{end}}

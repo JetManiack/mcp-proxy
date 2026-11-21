@@ -1,0 +1,155 @@
+{{define "content"}}
+<a href="/ui/upstreams" class="back-link">
+  <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M9 2L4 7l5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  Upstreams
+</a>
+
+<div class="page-header">
+  <div>
+    <h1 class="page-title">{{.Upstream.Name}}</h1>
+    <p class="page-desc">
+      {{if eq .Upstream.AuthType "oauth2_authorization_code"}}
+        <span class="badge badge-oauth">OAuth 2.0</span>
+      {{else}}
+        <span class="badge badge-none">{{.Upstream.AuthType}}</span>
+      {{end}}
+    </p>
+  </div>
+  {{if eq .Upstream.AuthType "oauth2_authorization_code"}}
+  <div class="actions-row">
+    {{if and .Status (eq .Status.Status "connected")}}
+      <span class="status-dot status-ok"></span><span class="status-label">Authorized</span>
+    {{else}}
+      <form method="POST" action="/ui/upstreams/{{.Upstream.ID}}/auth">
+        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+        <button class="btn btn-primary"{{if not .Upstream.AuthEndpoint}} disabled title="Discovery is still pending — reload in a moment"{{end}}>
+          <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M9 1.5L11.5 4 9 6.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M11.5 4H5a3 3 0 000 6h1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          Authorize
+        </button>
+      </form>
+    {{end}}
+  </div>
+  {{end}}
+</div>
+
+<div class="card">
+  <div class="card-head"><span class="card-label">Configuration</span></div>
+  <div class="detail">
+    <div class="detail-row">
+      <span class="detail-k">ID</span>
+      <span class="detail-v detail-v-mono">{{.Upstream.ID}}</span>
+    </div>
+    <div class="detail-row">
+      <span class="detail-k">URL</span>
+      <span class="detail-v detail-v-mono">{{.Upstream.URL}}</span>
+    </div>
+    <div class="detail-row">
+      <span class="detail-k">Auth type</span>
+      <span class="detail-v">{{.Upstream.AuthType}}</span>
+    </div>
+    <div class="detail-row">
+      <span class="detail-k">Auth endpoint</span>
+      <span class="detail-v detail-v-mono">
+        {{if .Upstream.AuthEndpoint}}{{.Upstream.AuthEndpoint}}{{else}}<span class="detail-empty">not set</span>{{end}}
+      </span>
+    </div>
+    <div class="detail-row">
+      <span class="detail-k">Token endpoint</span>
+      <span class="detail-v detail-v-mono">
+        {{if .Upstream.TokenEndpoint}}{{.Upstream.TokenEndpoint}}{{else}}<span class="detail-empty">not set</span>{{end}}
+      </span>
+    </div>
+    <div class="detail-row">
+      <span class="detail-k">DCR endpoint</span>
+      <span class="detail-v detail-v-mono">
+        {{if .Upstream.DCREndpoint}}{{.Upstream.DCREndpoint}}{{else}}<span class="detail-empty">not set</span>{{end}}
+      </span>
+    </div>
+  </div>
+</div>
+
+{{if .Status}}
+<div class="card" style="margin-top:16px">
+  <div class="card-head"><span class="card-label">Status</span></div>
+  <div class="detail">
+    <div class="detail-row">
+      <span class="detail-k">Connectivity</span>
+      <span class="detail-v">
+        {{if eq .Status.Status "connected"}}
+          <span class="status-dot status-ok"></span> Connected
+        {{else if eq .Status.Status "needs_auth"}}
+          <span class="status-dot status-warn"></span> Needs authorization
+        {{else if eq .Status.Status "pending_discovery"}}
+          <span class="status-dot status-warn"></span> Discovery in progress
+        {{else if eq .Status.Status "unreachable"}}
+          <span class="status-dot status-err"></span> Unreachable
+          {{if .Status.Error}}<span class="detail-empty" style="margin-left:8px">{{.Status.Error}}</span>{{end}}
+        {{else}}
+          <span class="status-dot status-idle"></span> Unknown
+        {{end}}
+      </span>
+    </div>
+  </div>
+</div>
+{{end}}
+
+{{if .Resources}}
+<div class="card" style="margin-top:16px">
+  <div class="card-head"><span class="card-label">Resources</span><span class="card-count">{{len .Resources}}</span></div>
+  <div class="tool-list">
+    {{range .Resources}}
+    <div class="tool-row">
+      <div class="tool-info">
+        <span class="tool-name">{{.Name}}</span>
+        <span class="tool-desc detail-v-mono" style="font-size:11px">{{.URI}}</span>
+        {{if .Description}}<span class="tool-desc">{{.Description}}</span>{{end}}
+      </div>
+      {{if .MIMEType}}<span class="badge badge-none" style="flex-shrink:0">{{.MIMEType}}</span>{{end}}
+    </div>
+    {{end}}
+  </div>
+</div>
+{{end}}
+
+{{if .Tools}}
+<div class="card" style="margin-top:16px">
+  <div class="card-head"><span class="card-label">Tools</span><span class="card-count">{{len .Tools}}</span></div>
+  <div class="tool-list">
+    {{range .Tools}}
+    <div class="tool-row">
+      <div class="tool-info">
+        <span class="tool-name{{if not .Enabled}} tool-name-disabled{{end}}">{{.Name}}</span>
+        {{if .Description}}<span class="tool-desc">{{.Description}}</span>{{end}}
+      </div>
+      <form method="POST" action="/ui/upstreams/{{$.Upstream.ID}}/tools/{{.Name}}" class="toggle-form">
+        <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+        {{if .Enabled}}
+          <input type="hidden" name="enabled" value="0">
+          <button type="submit" class="toggle toggle-on" title="Disable this tool">
+            <span class="toggle-knob"></span>
+          </button>
+        {{else}}
+          <input type="hidden" name="enabled" value="1">
+          <button type="submit" class="toggle toggle-off" title="Enable this tool">
+            <span class="toggle-knob"></span>
+          </button>
+        {{end}}
+      </form>
+    </div>
+    {{end}}
+  </div>
+</div>
+{{end}}
+
+<div class="card" style="margin-top:16px">
+  <div class="danger-zone">
+    <div class="card-label" style="margin-bottom:12px">Danger zone</div>
+    <form method="POST" action="/ui/upstreams/{{.Upstream.ID}}/delete">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <button class="btn btn-danger" onclick="return confirm('Delete upstream {{.Upstream.Name}} and all its tokens? This cannot be undone.')">
+        Delete upstream
+      </button>
+    </form>
+  </div>
+</div>
+{{end}}

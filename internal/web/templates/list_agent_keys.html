@@ -1,0 +1,64 @@
+{{define "content"}}
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Agent tokens</h1>
+    <p class="page-desc">Bearer tokens used by AI agents and MCP clients to authenticate.</p>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:16px">
+  <div class="card-head"><span class="card-label">New token</span></div>
+  <div class="card-body" style="padding-bottom:16px">
+    <form method="POST" action="/ui/tokens" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <div class="form-row" style="flex:1;min-width:200px;margin:0">
+        <label for="token-name">Name</label>
+        <input type="text" id="token-name" name="name" required placeholder="e.g. my-agent" autocomplete="off">
+      </div>
+      <button type="submit" class="btn btn-primary" style="margin-bottom:1px">Create token</button>
+    </form>
+  </div>
+</div>
+
+<div class="card">
+  {{if .Tokens}}
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Created</th>
+          <th>Last used</th>
+          <th style="text-align:right">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Tokens}}
+        <tr>
+          <td class="td-name">{{.Name}}</td>
+          <td class="td-muted">{{.CreatedAt.Format "2 Jan 2006, 15:04"}}</td>
+          <td class="td-muted">
+            {{if .LastUsedAt}}{{.LastUsedAt.Format "2 Jan 2006, 15:04"}}{{else}}never{{end}}
+          </td>
+          <td class="td-actions">
+            <form method="POST" action="/ui/tokens/{{.ID}}/delete">
+              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+              <button class="btn btn-danger btn-sm" onclick="return confirm('Revoke token {{.Name}}? Any client using it will immediately lose access.')">Revoke</button>
+            </form>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <div class="empty-state">
+    <div class="empty-icon">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M14 9a4 4 0 10-8 0v2H4v7h12v-7h-2V9z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10" cy="14" r="1" fill="currentColor"/></svg>
+    </div>
+    <div class="empty-title">No tokens yet</div>
+    <p class="empty-desc">Create a token and configure your MCP client to authenticate with it.</p>
+  </div>
+  {{end}}
+</div>
+{{end}}

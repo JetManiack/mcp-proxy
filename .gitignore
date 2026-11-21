@@ -1,0 +1,14 @@
+bin/
+/mcp-proxy
+coverage.out
+
+# local config files that may contain real credentials
+mcp-proxy.yaml
+config.yaml
+*.env
+.env*
+
+# TLS / key material
+*.pem
+*.key
+*.crt
