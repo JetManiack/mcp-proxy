@@ -26,10 +26,11 @@ type Upstream struct {
 	Name          string    `gorm:"not null"`
 	URL           string    `gorm:"not null"`
 	AuthType      string    `gorm:"not null"`
-	AuthEndpoint  string
-	TokenEndpoint string
-	DCREndpoint   string
-	CreatedAt     time.Time
+	AuthEndpoint      string
+	TokenEndpoint     string
+	DCREndpoint       string
+	ClientIDMetaDoc   bool `gorm:"default:false"`
+	CreatedAt         time.Time
 	UpdatedAt     time.Time
 }
 

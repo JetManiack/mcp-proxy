@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"log/slog"
@@ -27,6 +28,26 @@ func New(s *store.Store, reg *upstream.Registry, mgr *upstream.Manager, pool *mc
 	return &Handler{store: s, registry: reg, oauth: mgr, pool: pool}
 }
 
+// oauthClientMetadata serves the RFC 9728 §2.2 client metadata document.
+// The document URL is used as the OAuth2 client_id when the upstream's AS
+// supports client_id_metadata_document_supported (no DCR registration needed).
+func (h *Handler) oauthClientMetadata(w http.ResponseWriter, r *http.Request) {
+	if h.oauth == nil {
+		http.NotFound(w, r)
+		return
+	}
+	meta := map[string]any{
+		"client_id":                  h.oauth.ClientMetadataURL(),
+		"client_name":                "mcp-proxy",
+		"redirect_uris":              []string{h.oauth.CallbackURL()},
+		"grant_types":                []string{"authorization_code", "refresh_token"},
+		"response_types":             []string{"code"},
+		"token_endpoint_auth_method": "none",
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(meta)
+}
+
 // Routes returns an http.Handler covering all web UI and OAuth endpoints.
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
@@ -44,6 +65,7 @@ func (h *Handler) Routes() http.Handler {
 
 	// OAuth callback — no auth required (redirected from external auth server).
 	mux.HandleFunc("GET /oauth/callback", h.oauthCallback)
+	mux.HandleFunc("GET /oauth/client-metadata", h.oauthClientMetadata)
 
 	// Web UI — requires auth middleware added by the caller.
 	mux.HandleFunc("GET /ui/upstreams", h.listUpstreams)
