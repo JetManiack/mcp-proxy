@@ -13,9 +13,10 @@ import (
 
 // Meta holds the OAuth endpoints discovered for an upstream.
 type Meta struct {
-	AuthorizationEndpoint string
-	TokenEndpoint         string
-	DCREndpoint           string
+	AuthorizationEndpoint             string
+	TokenEndpoint                     string
+	DCREndpoint                       string
+	ClientIDMetadataDocumentSupported bool
 }
 
 type protectedResourceDoc struct {
@@ -23,9 +24,10 @@ type protectedResourceDoc struct {
 }
 
 type authServerDoc struct {
-	AuthorizationEndpoint string `json:"authorization_endpoint"`
-	TokenEndpoint         string `json:"token_endpoint"`
-	RegistrationEndpoint  string `json:"registration_endpoint"`
+	AuthorizationEndpoint             string `json:"authorization_endpoint"`
+	TokenEndpoint                     string `json:"token_endpoint"`
+	RegistrationEndpoint              string `json:"registration_endpoint"`
+	ClientIDMetadataDocumentSupported bool   `json:"client_id_metadata_document_supported"`
 }
 
 // Discover fetches OAuth endpoint metadata for an upstream by probing it for a
@@ -135,16 +137,32 @@ func discoverFromWWWAuthenticate(ctx context.Context, client *http.Client, upstr
 		return nil, fmt.Errorf("upstream: discover %s: no authorization_servers in protected resource doc", upstreamURL)
 	}
 
-	asURL := strings.TrimRight(pr.AuthorizationServers[0], "/") + "/.well-known/oauth-authorization-server"
+	asURL, err := authServerMetadataURL(pr.AuthorizationServers[0])
+	if err != nil {
+		return nil, fmt.Errorf("upstream: discover %s: build AS metadata URL: %w", upstreamURL, err)
+	}
 	var as authServerDoc
 	if err := getJSON(ctx, client, asURL, &as); err != nil {
 		return nil, fmt.Errorf("upstream: discover auth server %s: %w", pr.AuthorizationServers[0], err)
 	}
 	return &Meta{
-		AuthorizationEndpoint: as.AuthorizationEndpoint,
-		TokenEndpoint:         as.TokenEndpoint,
-		DCREndpoint:           as.RegistrationEndpoint,
+		AuthorizationEndpoint:             as.AuthorizationEndpoint,
+		TokenEndpoint:                     as.TokenEndpoint,
+		DCREndpoint:                       as.RegistrationEndpoint,
+		ClientIDMetadataDocumentSupported: as.ClientIDMetadataDocumentSupported,
 	}, nil
+}
+
+// authServerMetadataURL constructs the RFC 8414 §3 discovery URL for an OAuth AS.
+// Per the spec the .well-known path is always at the authority root, not under
+// the issuer's path component. For issuer https://host/path the URL is
+// https://host/.well-known/oauth-authorization-server (not /<path>/.well-known/…).
+func authServerMetadataURL(issuer string) (string, error) {
+	u, err := url.Parse(strings.TrimRight(issuer, "/"))
+	if err != nil {
+		return "", err
+	}
+	return u.Scheme + "://" + u.Host + "/.well-known/oauth-authorization-server", nil
 }
 
 // extractResourceMetadata parses the resource_metadata="<url>" token from a

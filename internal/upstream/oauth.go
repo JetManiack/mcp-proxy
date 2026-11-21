@@ -164,7 +164,7 @@ func (m *Manager) CompleteAuth(ctx context.Context, state, code string) error {
 		return fmt.Errorf("upstream: complete auth: %w", err)
 	}
 
-	creds, err := m.loadDCRCreds(ctx, up.ID)
+	creds, err := m.getClientCreds(ctx, up)
 	if err != nil {
 		return fmt.Errorf("upstream: complete auth: %w", err)
 	}
@@ -233,7 +233,7 @@ func (m *Manager) refreshToken(ctx context.Context, t *store.UpstreamUserToken) 
 	if err != nil {
 		return err
 	}
-	creds, err := m.loadDCRCreds(ctx, up.ID)
+	creds, err := m.getClientCreds(ctx, up)
 	if err != nil {
 		return err
 	}
@@ -263,8 +263,38 @@ func (m *Manager) refreshToken(ctx context.Context, t *store.UpstreamUserToken) 
 	return m.storeTokens(ctx, t.UpstreamID, t.UserID, tok)
 }
 
-// ensureDCRClientID returns the DCR client_id for the upstream, registering if needed.
-// A mutex prevents concurrent goroutines from racing to register the same upstream.
+// ClientMetadataURL returns the URL at which this proxy serves its OAuth2
+// client metadata document (RFC 9728 §2.2). It is used as the client_id when
+// the upstream's authorization server supports client_id_metadata_document_supported
+// and does not expose a DCR endpoint.
+func (m *Manager) ClientMetadataURL() string {
+	return m.publicURL + "/oauth/client-metadata"
+}
+
+// CallbackURL returns the OAuth2 redirect_uri this proxy uses.
+func (m *Manager) CallbackURL() string {
+	return m.publicURL + "/oauth/callback"
+}
+
+// getClientCreds returns the OAuth2 client credentials for an upstream.
+// Priority: stored DCR creds → client_id_metadata_doc URL → error.
+func (m *Manager) getClientCreds(ctx context.Context, up *store.Upstream) (*dcrCreds, error) {
+	creds, err := m.loadDCRCreds(ctx, up.ID)
+	if err == nil {
+		return creds, nil
+	}
+	if !store.IsNotFound(err) {
+		return nil, fmt.Errorf("get client creds: %w", err)
+	}
+	if up.ClientIDMetaDoc {
+		return &dcrCreds{ClientID: m.ClientMetadataURL()}, nil
+	}
+	return nil, fmt.Errorf("no OAuth2 client credentials: upstream has no DCR endpoint and client_id_metadata_document_supported is not set")
+}
+
+// ensureDCRClientID returns the OAuth2 client_id for the upstream.
+// If DCR is available it registers on first use; if the AS supports
+// client_id_metadata_document the proxy URL is used directly.
 func (m *Manager) ensureDCRClientID(ctx context.Context, up *store.Upstream) (string, error) {
 	m.dcrMu.Lock()
 	defer m.dcrMu.Unlock()
@@ -276,8 +306,15 @@ func (m *Manager) ensureDCRClientID(ctx context.Context, up *store.Upstream) (st
 	if !store.IsNotFound(err) {
 		return "", fmt.Errorf("DCR: load existing credential: %w", err)
 	}
-	// Not registered yet — run DCR.
-	return m.registerDCR(ctx, up)
+	if up.DCREndpoint != "" {
+		// Run DCR registration.
+		return m.registerDCR(ctx, up)
+	}
+	if up.ClientIDMetaDoc {
+		// Use proxy's public URL as client_id per RFC 9728 §2.2.
+		return m.ClientMetadataURL(), nil
+	}
+	return "", fmt.Errorf("upstream: register DCR: dcr_endpoint is empty and client_id_metadata_document_supported is not set")
 }
 
 func (m *Manager) loadDCRCreds(ctx context.Context, upstreamID uuid.UUID) (*dcrCreds, error) {
