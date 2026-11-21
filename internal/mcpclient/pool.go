@@ -92,6 +92,10 @@ type Pool struct {
 	// triggerCh signals the reconcile loop to run immediately.
 	// Buffered (1) so callers never block; excess signals are coalesced.
 	triggerCh chan struct{}
+
+	// onCatalogChange is called after each refreshCatalog that stores a new
+	// catalog. Used by direct-tools mode to rebuild the MCP server tool list.
+	onCatalogChange func()
 }
 
 // NewPool creates a Pool.
@@ -104,6 +108,12 @@ func NewPool(s *store.Store, encKey []byte, discoverer Discoverer, manager OAuth
 		entries:    make(map[sessionKey]*sessionEntry),
 		triggerCh:  make(chan struct{}, 1),
 	}
+}
+
+// SetCatalogChangeHook registers a function called after each catalog refresh.
+// Only one hook is supported; a second call replaces the first.
+func (p *Pool) SetCatalogChangeHook(fn func()) {
+	p.onCatalogChange = fn
 }
 
 // TriggerReconcile asks the reconcile loop to run on its next opportunity.
@@ -213,6 +223,9 @@ func (p *Pool) refreshCatalog(ctx context.Context) {
 	}
 	p.catalog.Store(NewCatalog(entries))
 	slog.Debug("mcpclient: catalog refreshed", "tools", len(entries))
+	if p.onCatalogChange != nil {
+		p.onCatalogChange()
+	}
 }
 
 // NamespacedResource associates a resource with its upstream.
