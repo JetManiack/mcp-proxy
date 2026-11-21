@@ -3,6 +3,8 @@
 //   - mcp_tool_search   — keyword search over all upstream tools
 //   - mcp_tool_call     — call a specific upstream tool on behalf of the caller
 //   - upstream_status   — list connectivity/auth state for all upstreams
+//   - mcp_resource_list — list documentation resources across all upstreams
+//   - mcp_resource_read — read a documentation resource by namespaced URI
 package mcpserver
 
 import (
@@ -199,12 +201,31 @@ func (s *Server) handleSearch(ctx context.Context, req *mcp.CallToolRequest, arg
 	}, nil, nil
 }
 
+// proxyToolNames lists tools provided by the proxy itself. Routing them through
+// mcp_tool_call to an upstream is always wrong; return a clear error so agents
+// don't loop on "unknown tool" responses.
+var proxyToolNames = map[string]bool{
+	"mcp_tool_search":   true,
+	"mcp_tool_call":     true,
+	"upstream_status":   true,
+	"mcp_resource_list": true,
+	"mcp_resource_read": true,
+}
+
 func (s *Server) handleCall(ctx context.Context, req *mcp.CallToolRequest, args callArgs) (*mcp.CallToolResult, any, error) {
-	if args.UpstreamID == "" {
-		return errorResult("upstream_id is required"), nil, nil
-	}
 	if args.ToolName == "" {
 		return errorResult("tool_name is required"), nil, nil
+	}
+
+	if proxyToolNames[args.ToolName] {
+		return errorResult(fmt.Sprintf(
+			"%q is a proxy-level tool; call it directly without upstream_id (do not route it through mcp_tool_call)",
+			args.ToolName,
+		)), nil, nil
+	}
+
+	if args.UpstreamID == "" {
+		return errorResult("upstream_id is required"), nil, nil
 	}
 
 	upstreamID, err := uuid.Parse(args.UpstreamID)
