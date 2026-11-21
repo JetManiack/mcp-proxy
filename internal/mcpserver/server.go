@@ -168,18 +168,28 @@ func (s *Server) handleSearch(ctx context.Context, req *mcp.CallToolRequest, arg
 	entries := cat.Search(args.Query, max)
 
 	type result struct {
-		ToolName     string `json:"tool_name"`
-		Description  string `json:"description"`
-		UpstreamID   string `json:"upstream_id"`
-		UpstreamName string `json:"upstream_name"`
+		ToolName     string          `json:"tool_name"`
+		Description  string          `json:"description"`
+		UpstreamID   string          `json:"upstream_id"`
+		UpstreamName string          `json:"upstream_name"`
+		InputSchema  json.RawMessage `json:"input_schema,omitempty"`
 	}
 	out := make([]result, 0, len(entries))
 	for _, e := range entries {
+		var schema json.RawMessage
+		if e.Tool.InputSchema != nil {
+			if b, err := json.Marshal(e.Tool.InputSchema); err != nil {
+				slog.Warn("mcp_tool_search: marshal input_schema", "tool", e.Tool.Name, "err", err)
+			} else {
+				schema = b
+			}
+		}
 		out = append(out, result{
 			ToolName:     e.Tool.Name,
 			Description:  e.Tool.Description,
 			UpstreamID:   e.UpstreamID.String(),
 			UpstreamName: e.UpstreamName,
+			InputSchema:  schema,
 		})
 	}
 

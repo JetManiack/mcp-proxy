@@ -121,6 +121,59 @@ func TestMCPToolSearch(t *testing.T) {
 	}
 }
 
+func TestMCPToolSearch_IncludesInputSchema(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	hs := newMockUpstream(t)
+	up := &store.Upstream{
+		Name:     "schema-mock-" + uuid.New().String()[:8],
+		URL:      hs.URL,
+		AuthType: "none",
+	}
+	if err := s.CreateUpstream(ctx, up); err != nil {
+		t.Fatalf("CreateUpstream: %v", err)
+	}
+	t.Cleanup(func() { _ = s.DeleteUpstream(ctx, up.ID) })
+
+	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
+	t.Cleanup(pool.Close)
+
+	proxySrv := mcpserver.New(pool)
+	sess := connectProxyClient(t, proxySrv.Handler(), uuid.Nil)
+
+	res, err := sess.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "mcp_tool_search",
+		Arguments: map[string]any{"query": "echo"},
+	})
+	if err != nil {
+		t.Fatalf("mcp_tool_search: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("mcp_tool_search returned error: %v", res.Content)
+	}
+
+	if len(res.Content) == 0 {
+		t.Fatal("mcp_tool_search: empty content")
+	}
+	var results []map[string]json.RawMessage
+	text := res.Content[0].(*mcp.TextContent).Text
+	if err := json.Unmarshal([]byte(text), &results); err != nil {
+		t.Fatalf("unmarshal: %v — raw: %s", err, text)
+	}
+	if len(results) == 0 {
+		t.Fatal("expected at least one result")
+	}
+	raw, ok := results[0]["input_schema"]
+	if !ok || len(raw) == 0 || string(raw) == "null" {
+		t.Fatalf("input_schema missing or null in result: %s", text)
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("input_schema is not a valid JSON object: %v", err)
+	}
+}
+
 func TestMCPToolCall(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
