@@ -41,19 +41,24 @@ func newOAuthServer(t *testing.T) (*httptest.Server, *http.Client) {
 	var srv *httptest.Server
 
 	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"authorization_endpoint": srv.URL + "/authorize",
-			"token_endpoint":         srv.URL + "/token",
-			"registration_endpoint":  srv.URL + "/register",
+			"issuer":                           srv.URL,
+			"authorization_endpoint":           srv.URL + "/authorize",
+			"token_endpoint":                   srv.URL + "/token",
+			"registration_endpoint":            srv.URL + "/register",
+			"code_challenge_methods_supported": []string{"S256"},
 		})
 	})
 	mux.HandleFunc("/register", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"client_id":     "test-client-id",
 			"client_secret": "test-client-secret",
 		})
 	})
 	mux.HandleFunc("/token", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		exp := time.Now().Add(time.Hour).Unix()
 		json.NewEncoder(w).Encode(map[string]any{
 			"access_token":  "test-access-token",
@@ -76,8 +81,11 @@ func TestBeginAuth_URLParams(t *testing.T) {
 	oauthSrv, oauthClient := newOAuthServer(t)
 
 	// Resource server points to oauthSrv as its authorization server.
-	resourceSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	var resourceSrv *httptest.Server
+	resourceSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
+			"resource":              resourceSrv.URL,
 			"authorization_servers": []string{oauthSrv.URL},
 		})
 	}))
@@ -162,9 +170,23 @@ func TestCompleteAuth_StoresTokens(t *testing.T) {
 		t.Fatalf("CompleteAuth: %v", err)
 	}
 
-	tok, err := s.GetUserToken(ctx, up.ID, user.ID)
-	if err != nil {
-		t.Fatalf("GetUserToken after CompleteAuth: %v", err)
+	// The token exchange and DB write happen in a goroutine after CompleteAuth returns.
+	// Retry on record-not-found until the write lands or the deadline expires.
+	var tok *store.UpstreamUserToken
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var err error
+		tok, err = s.GetUserToken(ctx, up.ID, user.ID)
+		if err == nil {
+			break
+		}
+		if !store.IsNotFound(err) {
+			t.Fatalf("GetUserToken after CompleteAuth: unexpected error: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("GetUserToken after CompleteAuth: token not stored within deadline: %v", err)
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 	if tok.Status != "authorized" {
 		t.Errorf("Status: got %q, want authorized", tok.Status)

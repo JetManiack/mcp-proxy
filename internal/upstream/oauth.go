@@ -199,7 +199,12 @@ func (m *Manager) BeginAuth(ctx context.Context, upstreamID, userID uuid.UUID) (
 
 	select {
 	case u := <-authURLCh:
-		return u, "", nil
+		parsed, err := url.Parse(u)
+		if err != nil {
+			cancel()
+			return "", "", fmt.Errorf("upstream: begin auth: parse redirect URL: %w", err)
+		}
+		return u, parsed.Query().Get("state"), nil
 	case <-time.After(30 * time.Second):
 		cancel()
 		return "", "", fmt.Errorf("upstream: begin auth: timeout waiting for auth URL (discovery failed?)")
