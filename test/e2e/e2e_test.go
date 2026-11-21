@@ -121,7 +121,7 @@ func TestE2E_AgentTokenFullChain(t *testing.T) {
 
 	// Wire up the proxy.
 	encKey := make([]byte, 32)
-	pool := mcpclient.NewPool(s, encKey, nil)
+	pool := mcpclient.NewPool(s, encKey, nil, nil)
 	t.Cleanup(pool.Close)
 
 	proxySrv := mcpserver.New(pool)

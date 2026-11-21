@@ -88,7 +88,7 @@ func TestMCPToolSearch(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.DeleteUpstream(ctx, up.ID) })
 
-	pool := mcpclient.NewPool(s, make([]byte, 32), nil)
+	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
 	t.Cleanup(pool.Close)
 
 	proxySrv := mcpserver.New(pool)
@@ -136,7 +136,7 @@ func TestMCPToolCall(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.DeleteUpstream(ctx, up.ID) })
 
-	pool := mcpclient.NewPool(s, make([]byte, 32), nil)
+	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
 	t.Cleanup(pool.Close)
 
 	proxySrv := mcpserver.New(pool)
@@ -166,7 +166,7 @@ func TestMCPToolCall_InvalidUpstreamID(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 
-	pool := mcpclient.NewPool(s, make([]byte, 32), nil)
+	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
 	t.Cleanup(pool.Close)
 
 	proxySrv := mcpserver.New(pool)
@@ -202,7 +202,7 @@ func TestUpstreamStatus(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.DeleteUpstream(ctx, up.ID) })
 
-	pool := mcpclient.NewPool(s, make([]byte, 32), nil)
+	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
 	t.Cleanup(pool.Close)
 
 	proxySrv := mcpserver.New(pool)

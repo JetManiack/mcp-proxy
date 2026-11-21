@@ -49,14 +49,12 @@ func CSRFMiddleware(next http.Handler) http.Handler {
 					http.Error(w, "internal error", http.StatusInternalServerError)
 					return
 				}
-				// Secure is omitted intentionally: the proxy is typically deployed
-				// behind an HTTPS-terminating reverse proxy, so TLS is external.
-				// SameSite=Strict already prevents cross-site submission attacks.
-				http.SetCookie(w, &http.Cookie{
+				http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set conditionally; true when TLS or behind HTTPS proxy
 					Name:     csrfCookieName,
 					Value:    token,
 					Path:     "/",
-					HttpOnly: false, // must be readable by the form submission
+					HttpOnly: true,
+					Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
 					SameSite: http.SameSiteStrictMode,
 					MaxAge:   3600,
 				})

@@ -61,7 +61,7 @@ func TestE2E_ToolToggle(t *testing.T) {
 
 	// Wire up the proxy stack.
 	encKey := make([]byte, 32)
-	pool := mcpclient.NewPool(s, encKey, nil)
+	pool := mcpclient.NewPool(s, encKey, nil, nil)
 	t.Cleanup(pool.Close)
 
 	proxySrv := mcpserver.New(pool)

@@ -65,7 +65,7 @@ func TestPoolCallTool(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.DeleteUpstream(ctx, up.ID) })
 
-	pool := mcpclient.NewPool(s, make([]byte, 32), nil)
+	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
 	t.Cleanup(pool.Close)
 
 	res, err := pool.CallTool(ctx, uuid.Nil, up.ID, "echo", map[string]any{"msg": "hello"})
@@ -97,7 +97,7 @@ func TestPoolGetCatalog(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.DeleteUpstream(ctx, up.ID) })
 
-	pool := mcpclient.NewPool(s, make([]byte, 32), nil)
+	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
 	t.Cleanup(pool.Close)
 
 	cat, err := pool.GetCatalog(ctx, uuid.Nil)
@@ -132,7 +132,7 @@ func TestPoolUpstreamStatuses_NeedsAuth(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.DeleteUpstream(ctx, up.ID) })
 
-	pool := mcpclient.NewPool(s, make([]byte, 32), nil)
+	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
 	t.Cleanup(pool.Close)
 
 	user, err := s.FindOrCreateUser(ctx, "status-user-"+uuid.New().String()+"@example.com", "Status User")

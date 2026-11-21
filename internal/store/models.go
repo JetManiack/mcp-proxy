@@ -22,16 +22,16 @@ func (u *User) BeforeCreate(_ *gorm.DB) error {
 }
 
 type Upstream struct {
-	ID            uuid.UUID `gorm:"type:uuid;primaryKey"`
-	Name          string    `gorm:"not null"`
-	URL           string    `gorm:"not null"`
-	AuthType      string    `gorm:"not null"`
-	AuthEndpoint      string
-	TokenEndpoint     string
-	DCREndpoint       string
-	ClientIDMetaDoc   bool `gorm:"default:false"`
-	CreatedAt         time.Time
-	UpdatedAt     time.Time
+	ID              uuid.UUID `gorm:"type:uuid;primaryKey"`
+	Name            string    `gorm:"not null"`
+	URL             string    `gorm:"not null"`
+	AuthType        string    `gorm:"not null"`
+	AuthEndpoint    string
+	TokenEndpoint   string
+	DCREndpoint     string
+	ClientIDMetaDoc bool `gorm:"default:false"`
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 func (u *Upstream) BeforeCreate(_ *gorm.DB) error {

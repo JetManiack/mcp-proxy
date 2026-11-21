@@ -185,13 +185,12 @@ func run(cfg *config.Config) error {
 	oauthMgr := upstream.NewManager(s, cfg.EncryptionKey, cfg.PublicURL, httpClient)
 
 	// MCP client pool.
-	pool := mcpclient.NewPool(s, cfg.EncryptionKey, nil)
+	pool := mcpclient.NewPool(s, cfg.EncryptionKey, nil, oauthMgr)
 	defer pool.Close()
 
 	// Start background loops.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	oauthMgr.StartRefreshLoop(ctx)
 	pool.StartReconcileLoop(ctx, registry)
 
 	// MCP server for agents.

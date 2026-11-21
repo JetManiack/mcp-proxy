@@ -15,6 +15,7 @@ import (
 	"github.com/JetManiack/mcp-proxy/internal/store"
 	"github.com/JetManiack/mcp-proxy/internal/telemetry"
 	"github.com/google/uuid"
+	sdkauth "github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -69,11 +70,17 @@ type Discoverer interface {
 	Discover(ctx context.Context, id uuid.UUID) error
 }
 
+// OAuthManager provides OAuth2 session handlers for the pool.
+type OAuthManager interface {
+	SessionHandler(ctx context.Context, up *store.Upstream, userID uuid.UUID) (sdkauth.OAuthHandler, error)
+}
+
 // Pool manages MCP client sessions for all configured upstreams.
 type Pool struct {
 	store      *store.Store
 	encKey     []byte
-	discoverer Discoverer // may be nil
+	discoverer Discoverer   // may be nil
+	manager    OAuthManager // may be nil
 
 	mu      sync.Mutex
 	entries map[sessionKey]*sessionEntry
@@ -88,11 +95,12 @@ type Pool struct {
 }
 
 // NewPool creates a Pool.
-func NewPool(s *store.Store, encKey []byte, discoverer Discoverer) *Pool {
+func NewPool(s *store.Store, encKey []byte, discoverer Discoverer, manager OAuthManager) *Pool {
 	return &Pool{
 		store:      s,
 		encKey:     encKey,
 		discoverer: discoverer,
+		manager:    manager,
 		entries:    make(map[sessionKey]*sessionEntry),
 		triggerCh:  make(chan struct{}, 1),
 	}
@@ -478,21 +486,17 @@ func (p *Pool) getSession(ctx context.Context, up *store.Upstream, userID uuid.U
 
 	switch up.AuthType {
 	case "oauth2_authorization_code":
-		tok, err := p.store.GetUserToken(ctx, up.ID, userID)
-		if err != nil {
-			return nil, fmt.Errorf("get user token: %w", err)
-		}
-		if tok.Status != "authorized" {
-			return nil, fmt.Errorf("token status %q for upstream %s", tok.Status, up.ID)
-		}
-		tokenHash = sha256.Sum256(tok.AccessToken)
 		key = sessionKey{upstreamID: up.ID, userID: userID}
-
-		plain, err := crypto.Decrypt(p.encKey, tok.AccessToken)
-		if err != nil {
-			return nil, fmt.Errorf("decrypt access token: %w", err)
+		if p.manager != nil {
+			tok, err := p.store.GetUserToken(ctx, up.ID, userID)
+			if err != nil {
+				return nil, fmt.Errorf("get user token: %w", err)
+			}
+			if tok.Status != "authorized" {
+				return nil, fmt.Errorf("token status %q for upstream %s", tok.Status, up.ID)
+			}
+			tokenHash = sha256.Sum256(tok.AccessToken)
 		}
-		accessToken = string(plain)
 	case "bearer_static":
 		cred, err := p.store.GetCredential(ctx, up.ID)
 		if err != nil {
@@ -529,7 +533,7 @@ func (p *Pool) getSession(ctx context.Context, up *store.Upstream, userID uuid.U
 		_ = old.session.Close()
 	}
 
-	// Build HTTP client with optional Bearer token.
+	// Build HTTP client with optional static Bearer token.
 	var httpClient *http.Client
 	if accessToken != "" {
 		httpClient = &http.Client{
@@ -539,6 +543,20 @@ func (p *Pool) getSession(ctx context.Context, up *store.Upstream, userID uuid.U
 		httpClient = http.DefaultClient
 	}
 
+	// For oauth2 upstreams attach the OAuthHandler from the manager so the
+	// transport uses the persisting token source (auto-refresh included).
+	var oauthHandler sdkauth.OAuthHandler
+	if up.AuthType == "oauth2_authorization_code" && p.manager != nil {
+		h, err := p.manager.SessionHandler(ctx, up, userID)
+		if err != nil {
+			return nil, fmt.Errorf("build session oauth handler: %w", err)
+		}
+		if h == nil {
+			return nil, fmt.Errorf("no authorized token for upstream %s", up.ID)
+		}
+		oauthHandler = h
+	}
+
 	client := mcp.NewClient(
 		&mcp.Implementation{Name: "mcp-proxy", Version: "v0.1.0"},
 		nil,
@@ -546,6 +564,7 @@ func (p *Pool) getSession(ctx context.Context, up *store.Upstream, userID uuid.U
 	transport := &mcp.StreamableClientTransport{
 		Endpoint:             up.URL,
 		HTTPClient:           httpClient,
+		OAuthHandler:         oauthHandler,
 		DisableStandaloneSSE: true,
 	}
 
