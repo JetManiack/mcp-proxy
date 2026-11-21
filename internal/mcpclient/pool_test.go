@@ -100,7 +100,7 @@ func TestPoolGetCatalog(t *testing.T) {
 	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
 	t.Cleanup(pool.Close)
 
-	cat, err := pool.GetCatalog(ctx, uuid.Nil)
+	cat, err := pool.GetCatalog(ctx)
 	if err != nil {
 		t.Fatalf("GetCatalog: %v", err)
 	}

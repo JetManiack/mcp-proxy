@@ -1,17 +1,10 @@
 // Package mcpserver exposes virtual MCP tools to downstream agents.
 //
-// Search mode (default): three meta-tools handle all upstream interaction.
-//
 //   - mcp_tool_search   — keyword search over all upstream tools
 //   - mcp_tool_call     — call a specific upstream tool on behalf of the caller
 //   - upstream_status   — list connectivity/auth state for all upstreams
 //   - mcp_resource_list — list documentation resources across all upstreams
 //   - mcp_resource_read — read a documentation resource by namespaced URI
-//
-// Direct mode (DirectTools=true): upstream tools are exposed individually in
-// tools/list. mcp_tool_search and mcp_tool_call are not registered; clients
-// aggregate and filter themselves. The tool list is rebuilt after each pool
-// reconcile so newly connected upstreams appear without a restart.
 package mcpserver
 
 import (
@@ -21,8 +14,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
-	"sync/atomic"
 
 	"github.com/JetManiack/mcp-proxy/internal/mcpclient"
 	"github.com/google/uuid"
@@ -31,108 +22,31 @@ import (
 
 // Server wraps an MCP server that proxies tool calls to upstream MCP servers.
 type Server struct {
-	pool        *mcpclient.Pool
-	directTools bool
-	// srv holds the active mcp.Server. In search mode it is set once; in direct
-	// mode it is atomically replaced after each catalog refresh.
-	srv atomic.Pointer[mcp.Server]
+	pool *mcpclient.Pool
+	srv  *mcp.Server
 }
 
-// New creates the MCP server.
-//
-// When directTools is false (search mode), three meta-tools are registered.
-// When directTools is true (direct mode), upstream tools are exposed directly
-// and the tool list is rebuilt on every pool catalog refresh.
-func New(pool *mcpclient.Pool, directTools bool) *Server {
-	s := &Server{pool: pool, directTools: directTools}
-	if directTools {
-		s.rebuildDirectServer()
-		pool.SetCatalogChangeHook(s.rebuildDirectServer)
-	} else {
-		srv := s.newBaseMCPServer()
-		mcp.AddTool(srv, toolSearch, s.handleSearch)
-		mcp.AddTool(srv, toolCall, s.handleCall)
-		s.srv.Store(srv)
-	}
-	return s
-}
-
-// newBaseMCPServer builds a fresh mcp.Server with the meta-tools that are
-// always present regardless of mode (status + resources + guide).
-func (s *Server) newBaseMCPServer() *mcp.Server {
+// New creates the MCP server and registers all meta-tools.
+func New(pool *mcpclient.Pool) *Server {
+	s := &Server{pool: pool}
 	srv := mcp.NewServer(
 		&mcp.Implementation{Name: "mcp-proxy", Version: "v0.1.0"},
 		nil,
 	)
+	mcp.AddTool(srv, toolSearch, s.handleSearch)
+	mcp.AddTool(srv, toolCall, s.handleCall)
 	mcp.AddTool(srv, toolStatus, s.handleStatus)
 	mcp.AddTool(srv, toolResourceList, s.handleResourceList)
 	mcp.AddTool(srv, toolResourceRead, s.handleResourceRead)
 	srv.AddResource(proxyGuideResource, handleProxyGuide)
-	return srv
-}
-
-// rebuildDirectServer builds a fresh mcp.Server from the current catalog and
-// atomically swaps it in. Called at startup and after each catalog refresh.
-// Only the shared (uuid.Nil) catalog is used, so per-user OAuth2 upstreams
-// are not included — their tokens are user-scoped and cannot be pre-registered.
-func (s *Server) rebuildDirectServer() {
-	cat, err := s.pool.GetCatalog(context.Background(), uuid.Nil)
-	if err != nil {
-		slog.Warn("mcpserver: direct tools: get catalog", "err", err)
-		if s.srv.Load() == nil {
-			// First build: store an empty server so Handler() never returns nil.
-			s.srv.Store(s.newBaseMCPServer())
-		}
-		return
-	}
-	srv := s.newBaseMCPServer()
-	for _, e := range cat.All() {
-		e := e
-		nsName := namespaceTool(e.UpstreamName, e.Tool.Name)
-		tool := &mcp.Tool{
-			Name:        nsName,
-			Description: e.Tool.Description,
-			InputSchema: e.Tool.InputSchema,
-		}
-		upstreamID := e.UpstreamID
-		origName := e.Tool.Name
-		mcp.AddTool(srv, tool, func(ctx context.Context, req *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
-			userID := userIDFromContext(ctx, req)
-			res, err := s.pool.CallTool(ctx, userID, upstreamID, origName, args)
-			if err != nil {
-				return errorResult(err.Error()), nil, nil
-			}
-			return res, nil, nil
-		})
-	}
-	s.srv.Store(srv)
-	slog.Debug("mcpserver: direct tools rebuilt", "tools", len(cat.All()))
-}
-
-// namespaceTool returns the tool name as it should appear in tools/list.
-// If toolName already starts with "<upstreamName>_" it is kept as-is;
-// otherwise upstreamName + "__" is prepended.
-func namespaceTool(upstreamName, toolName string) string {
-	if strings.HasPrefix(toolName, upstreamName+"_") {
-		return toolName
-	}
-	return upstreamName + "__" + toolName
+	s.srv = srv
+	return s
 }
 
 // Handler returns an http.Handler serving the MCP protocol.
-//
-// In direct-tools mode the handler is stateless: the server instance is swapped
-// atomically after each catalog refresh, and stateless mode ensures every POST
-// request is dispatched to whatever server is currently loaded rather than being
-// bound to the instance that handled the original connection.
 func (s *Server) Handler() http.Handler {
-	if s.directTools {
-		return mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
-			return s.srv.Load()
-		}, &mcp.StreamableHTTPOptions{Stateless: true})
-	}
 	return mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
-		return s.srv.Load()
+		return s.srv
 	}, nil)
 }
 
@@ -241,15 +155,13 @@ type callArgs struct {
 
 type statusArgs struct{}
 
-func (s *Server) handleSearch(ctx context.Context, req *mcp.CallToolRequest, args searchArgs) (*mcp.CallToolResult, any, error) {
-	userID := userIDFromContext(ctx, req)
-
+func (s *Server) handleSearch(ctx context.Context, _ *mcp.CallToolRequest, args searchArgs) (*mcp.CallToolResult, any, error) {
 	max := 20
 	if args.MaxResults != nil && *args.MaxResults > 0 {
 		max = *args.MaxResults
 	}
 
-	cat, err := s.pool.GetCatalog(ctx, userID)
+	cat, err := s.pool.GetCatalog(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("mcp_tool_search: get catalog: %w", err)
 	}

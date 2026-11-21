@@ -92,10 +92,6 @@ type Pool struct {
 	// triggerCh signals the reconcile loop to run immediately.
 	// Buffered (1) so callers never block; excess signals are coalesced.
 	triggerCh chan struct{}
-
-	// onCatalogChange is called after each refreshCatalog that stores a new
-	// catalog. Used by direct-tools mode to rebuild the MCP server tool list.
-	onCatalogChange func()
 }
 
 // NewPool creates a Pool.
@@ -108,12 +104,6 @@ func NewPool(s *store.Store, encKey []byte, discoverer Discoverer, manager OAuth
 		entries:    make(map[sessionKey]*sessionEntry),
 		triggerCh:  make(chan struct{}, 1),
 	}
-}
-
-// SetCatalogChangeHook registers a function called after each catalog refresh.
-// Only one hook is supported; a second call replaces the first.
-func (p *Pool) SetCatalogChangeHook(fn func()) {
-	p.onCatalogChange = fn
 }
 
 // TriggerReconcile asks the reconcile loop to run on its next opportunity.
@@ -189,10 +179,10 @@ func (p *Pool) reconcile(ctx context.Context, discoverer Discoverer) {
 	p.refreshCatalog(ctx)
 }
 
-// refreshCatalog rebuilds and caches the tool catalog for the shared (uuid.Nil)
-// user. This covers all non-per-user upstreams (bearer, api_key, none, etc.).
-// Per-user oauth2 sessions are excluded; they will add their tools when
-// GetCatalog is called with a real userID.
+// refreshCatalog rebuilds and caches the shared tool catalog by connecting to
+// every upstream without user credentials (uuid.Nil). Non-oauth2 upstreams always
+// connect; oauth2 upstreams connect unauthenticated so their tools still appear in
+// mcp_tool_search. Auth is enforced per-user at CallTool time.
 func (p *Pool) refreshCatalog(ctx context.Context) {
 	upstreams, err := p.store.ListUpstreams(ctx)
 	if err != nil {
@@ -223,9 +213,6 @@ func (p *Pool) refreshCatalog(ctx context.Context) {
 	}
 	p.catalog.Store(NewCatalog(entries))
 	slog.Debug("mcpclient: catalog refreshed", "tools", len(entries))
-	if p.onCatalogChange != nil {
-		p.onCatalogChange()
-	}
 }
 
 // NamespacedResource associates a resource with its upstream.
@@ -332,69 +319,27 @@ func (p *Pool) Close() {
 	p.entries = make(map[sessionKey]*sessionEntry)
 }
 
-// GetCatalog returns a searchable Catalog of tools available to userID.
-//
-// Non-per-user upstreams (bearer, api_key, none) are served from the in-memory
-// cache built during the last reconcile cycle. Per-user oauth2 upstreams are
-// queried live and their tools are merged on top of the cached entries.
-//
-// Upstreams that are inaccessible are silently skipped.
-func (p *Pool) GetCatalog(ctx context.Context, userID uuid.UUID) (*Catalog, error) {
-	cached := p.catalog.Load()
-
-	// No cache yet (before first reconcile): fall back to a live query.
-	if cached == nil {
-		return p.getCatalogLive(ctx, userID)
-	}
-
-	// If the caller is the anonymous user, the cache is complete.
-	if userID == uuid.Nil {
+// GetCatalog returns a searchable Catalog of all upstream tools.
+// All upstreams are visible to all callers regardless of OAuth2 authorization
+// state — isolation is enforced at CallTool time, not at discovery time.
+// Falls back to a live query before the first reconcile cycle completes.
+func (p *Pool) GetCatalog(ctx context.Context) (*Catalog, error) {
+	if cached := p.catalog.Load(); cached != nil {
 		return cached, nil
 	}
-
-	// For a real user, merge per-user oauth2 entries on top of the cache.
-	upstreams, err := p.store.ListUpstreams(ctx)
-	if err != nil {
-		return cached, nil // degrade gracefully
-	}
-	extra := cached.All()
-	for _, up := range upstreams {
-		if up.AuthType != "oauth2_authorization_code" {
-			continue
-		}
-		sess, err := p.getSession(ctx, up, userID)
-		if err != nil {
-			continue
-		}
-		filters, _ := p.store.GetToolFilters(ctx, up.ID)
-		for tool, err := range sess.Tools(ctx, nil) {
-			if err != nil {
-				break
-			}
-			if enabled, ok := filters[tool.Name]; ok && !enabled {
-				continue
-			}
-			tc := *tool
-			extra = append(extra, &CatalogEntry{
-				Tool:         &tc,
-				UpstreamID:   up.ID,
-				UpstreamName: up.Name,
-			})
-		}
-	}
-	return NewCatalog(extra), nil
+	return p.getCatalogLive(ctx)
 }
 
 // getCatalogLive builds the catalog by querying every upstream live (fallback
 // used before the first reconcile cycle completes).
-func (p *Pool) getCatalogLive(ctx context.Context, userID uuid.UUID) (*Catalog, error) {
+func (p *Pool) getCatalogLive(ctx context.Context) (*Catalog, error) {
 	upstreams, err := p.store.ListUpstreams(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("mcpclient: list upstreams: %w", err)
 	}
 	var entries []*CatalogEntry
 	for _, up := range upstreams {
-		sess, err := p.getSession(ctx, up, userID)
+		sess, err := p.getSession(ctx, up, uuid.Nil)
 		if err != nil {
 			continue
 		}
@@ -500,7 +445,10 @@ func (p *Pool) getSession(ctx context.Context, up *store.Upstream, userID uuid.U
 	switch up.AuthType {
 	case "oauth2_authorization_code":
 		key = sessionKey{upstreamID: up.ID, userID: userID}
-		if p.manager != nil {
+		// uuid.Nil means catalog/discovery context — connect without credentials so
+		// all oauth2 upstreams appear in mcp_tool_search regardless of auth state.
+		// A real user's token is required only when userID is set (CallTool path).
+		if p.manager != nil && userID != uuid.Nil {
 			tok, err := p.store.GetUserToken(ctx, up.ID, userID)
 			if err != nil {
 				return nil, fmt.Errorf("get user token: %w", err)
@@ -559,7 +507,7 @@ func (p *Pool) getSession(ctx context.Context, up *store.Upstream, userID uuid.U
 	// For oauth2 upstreams attach the OAuthHandler from the manager so the
 	// transport uses the persisting token source (auto-refresh included).
 	var oauthHandler sdkauth.OAuthHandler
-	if up.AuthType == "oauth2_authorization_code" && p.manager != nil {
+	if up.AuthType == "oauth2_authorization_code" && p.manager != nil && userID != uuid.Nil {
 		h, err := p.manager.SessionHandler(ctx, up, userID)
 		if err != nil {
 			return nil, fmt.Errorf("build session oauth handler: %w", err)
