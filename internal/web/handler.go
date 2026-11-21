@@ -281,6 +281,10 @@ func (h *Handler) toggleTool(w http.ResponseWriter, r *http.Request) {
 		httpError(w, err, http.StatusInternalServerError)
 		return
 	}
+	if r.Header.Get("Accept") == "application/json" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	http.Redirect(w, r, "/ui/upstreams/"+up.ID.String(), http.StatusSeeOther)
 }
 
