@@ -36,9 +36,6 @@ type Config struct {
 	PublicURL     string     `yaml:"public_url"`
 	EncryptionKey []byte     `yaml:"-"`
 	Auth          AuthConfig `yaml:"auth"`
-	// DirectTools exposes upstream tools directly in tools/list instead of routing
-	// all calls through mcp_tool_search / mcp_tool_call. Clients handle aggregation.
-	DirectTools bool `yaml:"direct_tools"`
 }
 
 // LoadFile overlays cfg with values from a YAML file. Only fields present in

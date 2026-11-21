@@ -64,7 +64,7 @@ func TestE2E_ToolToggle(t *testing.T) {
 	pool := mcpclient.NewPool(s, encKey, nil, nil)
 	t.Cleanup(pool.Close)
 
-	proxySrv := mcpserver.New(pool, false)
+	proxySrv := mcpserver.New(pool)
 	proxyHandler := web.AgentTokenAuthHandler(s, proxySrv.Handler())
 	proxySrvHTTP := httptest.NewServer(proxyHandler)
 	t.Cleanup(proxySrvHTTP.Close)
@@ -174,7 +174,7 @@ func TestE2E_ToolToggle(t *testing.T) {
 		// Wait briefly for the goroutine; in tests there's no background loop,
 		// so we call refreshCatalog indirectly by checking GetCatalog falls back
 		// to live query (catalog is nil since StartReconcileLoop wasn't called).
-		cat, err := pool.GetCatalog(ctx, uuid.Nil)
+		cat, err := pool.GetCatalog(ctx)
 		if err != nil {
 			t.Fatalf("GetCatalog: %v", err)
 		}
