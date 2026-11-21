@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -94,7 +95,12 @@ func ProbeAuthType(ctx context.Context, client *http.Client, upstreamURL string)
 	// oauth2: run full discovery chain.
 	meta, err := discoverFromWWWAuthenticate(ctx, client, upstreamURL, wwwAuth)
 	if err != nil {
-		return nil, err
+		// Discovery failed (e.g. the well-known endpoint is behind an auth proxy
+		// that causes a redirect loop). Fall back to bearer_static so the upstream
+		// can still be created; the operator can enter a static token manually.
+		slog.Warn("upstream: oauth2 discovery failed, falling back to bearer_static",
+			"upstream", upstreamURL, "err", err)
+		return &ProbeResult{AuthType: "bearer_static"}, nil
 	}
 	return &ProbeResult{AuthType: "oauth2_authorization_code", Meta: meta}, nil
 }
