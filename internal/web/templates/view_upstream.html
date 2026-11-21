@@ -68,6 +68,23 @@
   </div>
 </div>
 
+{{if eq .Upstream.AuthType "bearer_static"}}
+<div class="card" style="margin-top:16px">
+  <div class="card-head"><span class="card-label">Bearer token</span></div>
+  <div class="card-body">
+    <form method="POST" action="/ui/upstreams/{{.Upstream.ID}}/credential">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <div class="form-row" style="margin-bottom:12px">
+        <label for="static_token">New token</label>
+        <input type="password" id="static_token" name="static_token" placeholder="sk-…" autocomplete="new-password" spellcheck="false" required style="width:100%">
+        <span class="form-hint">Replaces the stored token. Sent as <code>Authorization: Bearer …</code> on every request.</span>
+      </div>
+      <button type="submit" class="btn btn-primary">Update token</button>
+    </form>
+  </div>
+</div>
+{{end}}
+
 {{if .Status}}
 <div class="card" style="margin-top:16px">
   <div class="card-head"><span class="card-label">Status</span></div>

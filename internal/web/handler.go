@@ -51,6 +51,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /ui/upstreams/new", h.newUpstreamForm)
 	mux.HandleFunc("GET /ui/upstreams/{id}", h.viewUpstream)
 	mux.HandleFunc("POST /ui/upstreams/{id}/tools/{tool}", h.toggleTool)
+	mux.HandleFunc("POST /ui/upstreams/{id}/credential", h.setCredential)
 	mux.HandleFunc("POST /ui/upstreams/{id}/auth", h.beginAuth)
 	mux.HandleFunc("POST /ui/upstreams/{id}/delete", h.deleteUpstream)
 
@@ -277,6 +278,30 @@ func (h *Handler) beginAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, redirectURL, http.StatusFound)
+}
+
+func (h *Handler) setCredential(w http.ResponseWriter, r *http.Request) {
+	up, ok := h.upstreamFromPath(w, r)
+	if !ok {
+		return
+	}
+	if up.AuthType != "bearer_static" {
+		httpError(w, fmt.Errorf("credential update only supported for bearer_static upstreams"), http.StatusBadRequest)
+		return
+	}
+	token := strings.TrimSpace(r.FormValue("static_token"))
+	if token == "" {
+		httpError(w, fmt.Errorf("static_token is required"), http.StatusBadRequest)
+		return
+	}
+	if err := h.oauth.SetStaticCredential(r.Context(), up.ID, token); err != nil {
+		httpError(w, fmt.Errorf("store token: %w", err), http.StatusInternalServerError)
+		return
+	}
+	if h.pool != nil {
+		h.pool.TriggerReconcile()
+	}
+	http.Redirect(w, r, "/ui/upstreams/"+up.ID.String(), http.StatusSeeOther)
 }
 
 func (h *Handler) deleteUpstream(w http.ResponseWriter, r *http.Request) {
