@@ -40,15 +40,15 @@ The proxy also exposes a `resource://mcp-proxy/guide` resource with a full usage
 
 ## Upstream auth types
 
-| Type | Credentials stored | Per-user? |
+| Type | Credentials stored | Shared? |
 |---|---|---|
-| `none` | — | no |
-| `bearer_static` | token | no |
-| `api_key` | header name + value | no |
-| `basic_auth` | username + password | no |
+| `none` | — | yes |
+| `bearer_static` | token | yes |
 | `oauth2_authorization_code` | access + refresh tokens | **yes** |
 
-Credentials are encrypted at rest with AES-256-GCM. Per-user OAuth2 tokens are isolated: user A cannot read user B's tokens.
+For `oauth2_authorization_code`: one person authorizes via the web UI browser flow, and the resulting token is shared across all agents. No per-agent or per-user credential isolation — the proxy acts as a single OAuth2 client on behalf of everyone.
+
+All credentials are encrypted at rest with AES-256-GCM.
 
 ## Running
 
@@ -121,7 +121,7 @@ Override with `--agent-addr`, `--listen-addr`, `--probe-addr`.
 The UI (`:8081`) lets operators:
 
 - Add and remove upstream MCP servers
-- Authorize per-user OAuth2 upstreams (opens the upstream's browser flow)
+- Authorize OAuth2 upstreams (opens the upstream's browser flow — resulting token is shared by all agents)
 - Create and revoke agent Bearer tokens
 - Enable or disable individual upstream tools per-upstream
 
