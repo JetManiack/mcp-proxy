@@ -6,109 +6,128 @@ Several MCP servers require OAuth2 browser-based authorization.
 This makes them unusable by agents running in Kubernetes, where no browser is available.
 
 **Solution:** A proxy that holds OAuth2 sessions on behalf of a human operator and exposes the
-upstream MCPs to k8s agents via a simple Bearer token — no browser required from the agent side.
+upstream MCPs to agents via a simple Bearer token — no browser required from the agent side.
 
 ## Architecture Overview
 
 ```
-[AI agent / k8s agent]  --Bearer mcp_xxxx-->  [mcp-proxy /mcp]
-                                                    |
-                                    ┌───────────────┴────────────────┐
-                                    │       ToolCatalog (in-memory)   │
-                                    │  mcp_tool_search                │
-                                    │  mcp_tool_call                  │
-                                    │  upstream_status (always on)    │
-                                    └───────────────┬────────────────┘
-                                                    |
-                              ┌─────────────────────┼──────────────────────┐
-                        [Upstream A]         [Upstream B]           [Upstream C]
-                     Bearer <token>       Bearer <token>          Bearer <token>
+[AI agent / k8s agent]  --Bearer mcp_xxxx-->  [mcp-proxy /mcp :8080]
+                                                      |
+                                        ┌─────────────┴──────────────┐
+                                        │   Tool Catalog (in-memory)  │
+                                        │   mcp_tool_search           │
+                                        │   mcp_tool_call             │
+                                        │   upstream_status           │
+                                        │   mcp_resource_list/read    │
+                                        └─────────────┬──────────────┘
+                                                      |
+                            ┌─────────────────────────┼────────────────────────┐
+                      [Upstream A]            [Upstream B]              [Upstream C]
+                     Bearer <token>          OAuth2 session              no auth
 ```
 
-The proxy presents itself to the agent as a single MCP server with three virtual tools.
-The real upstream tools are discovered via search, not advertised upfront, to avoid flooding
-the agent's context window with hundreds of tool schemas.
+The proxy presents itself to the agent as a single MCP server. All upstream tools are visible
+to all agents regardless of auth state — isolation is enforced at call time, not discovery time.
 
 ## Components
 
 ### 1. MCP Server (downstream — for agents)
 
-Exposes three tools, always:
+Exposes five virtual tools, always:
 
 | Tool | Description |
 |---|---|
-| `mcp_tool_search(query, top_k=5)` | Keyword search over in-memory tool index. Returns tool names and descriptions. |
-| `mcp_tool_call(tool_name, arguments)` | Dispatch: routes the call to the upstream that owns the named tool. |
-| `upstream_status()` | Returns the authorization status of every configured upstream. The agent calls this and notifies the operator if reauth is needed. |
+| `mcp_tool_search(query, max_results)` | Keyword search over in-memory tool catalog. Returns tool name, description, upstream ID, and input schema. |
+| `mcp_tool_call(upstream_id, tool_name, args)` | Routes the call to the specified upstream. |
+| `upstream_status()` | Returns connectivity and auth status of every configured upstream. |
+| `mcp_resource_list()` | Lists all documentation resources from all upstreams (namespaced URIs). |
+| `mcp_resource_read(uri)` | Reads a resource by its namespaced URI. |
 
-Tool search uses keyword matching (lowercase, whitespace-split, name+description scored).
-No embedding model required.
+Also exposes a `resource://mcp-proxy/guide` resource with a full usage guide for agents.
+
+Tool search uses keyword matching (lowercase, name + description scored). No embedding model required.
+
+Typical agent flow:
+```
+mcp_tool_search(query="run shell command")
+→ [{"tool_name":"exec","upstream_id":"...","upstream_name":"sandbox","input_schema":{...}}]
+
+mcp_tool_call(upstream_id="...", tool_name="exec", args={"command":"echo hi"})
+→ "hi"
+```
 
 ### 2. MCP Client Pool (upstream — to each backend)
 
-One reusable MCP session per authorized upstream (Streamable HTTP transport, go-sdk v1.8.0).
-Reconnects on failure. On connect: calls `tools/list`, updates the in-memory ToolCatalog.
+One reusable MCP client session per upstream (Streamable HTTP transport, go-sdk).
+Session key: `(upstream_id, uuid.Nil)` — always shared, never per-user.
 
-### 3. Tool Catalog & Namespace
+On connect: calls `tools/list`, populates the in-memory tool catalog.
+Reconnects automatically on failure (session is invalidated and recreated on next call).
+
+A background reconcile loop runs every 30 seconds to:
+- Trigger OAuth discovery for new `oauth2_authorization_code` upstreams.
+- Refresh the tool catalog from all upstreams.
+
+### 3. Tool Catalog
 
 All upstream tools are merged into one in-memory index used by `mcp_tool_search`.
+The catalog is rebuilt by the reconcile loop and also computed live on the first request
+(before the first reconcile cycle completes).
 
-Namespace rule applied at ingestion:
-1. Normalize upstream name: lowercase, spaces/hyphens → `_`
-2. If the tool name already starts with `{upstream_name}_` → keep as-is
-3. Otherwise prefix: e.g. an upstream named `issues` with tool `search` → `issues_search`
+Tools disabled via the web UI (`tool_filters` table) are excluded from both the catalog
+and `mcp_tool_call` (double enforcement).
 
-This ensures tools already prefixed with the upstream name are unchanged while others get a prefix.
+### 4. OAuth Manager (`oauth2_authorization_code` only)
 
-### 4. OAuth Manager (per upstream, `oauth2_authorization_code` only)
-
-Handles the full browser-based OAuth flow for a specific (upstream, user) pair:
+Handles the full browser-based OAuth flow:
 
 1. **Discovery** — `GET {url}/.well-known/oauth-protected-resource` + `oauth-authorization-server`
 2. **DCR** — `POST /register` → stores `client_id` / `client_secret` encrypted in DB.
-   Many upstreams keep DCR data in-memory and lose it on restart; we store it durably. On `invalid_client` error → re-register.
-3. **Authorization** — user clicks "Authorize" in Web UI → browser redirects to upstream IdP with PKCE `code_challenge`. `redirect_uri` = `{PUBLIC_URL}/oauth/callback`.
-4. **Callback** — `GET /oauth/callback?upstream_id=...&code=...` → token exchange → store tokens.
-5. **Refresh goroutine** — background worker checks all `upstream_user_tokens`; refreshes at `expires_at - 5min`.
-   If no `refresh_token` or refresh fails → status becomes `reauth_required`.
+   Stored durably because many upstreams lose DCR data on restart.
+3. **Authorization** — user clicks "Authorize" in Web UI → browser redirects to upstream IdP
+   with PKCE `code_challenge`. `redirect_uri` = `{PUBLIC_URL}/oauth/callback`.
+4. **Callback** — `GET /oauth/callback?code=...&state=...` → token exchange → store token
+   with `user_id = uuid.Nil` (shared token, not tied to the authorizing user).
+5. **Auto-refresh** — a `persistingTokenSource` wraps the oauth2 token; refreshed tokens
+   are written back to the DB automatically on each use.
+
+**Shared token model:** one person authorizes via the UI; the resulting token is used by all
+agents. The authorizing user's identity is irrelevant — `BeginAuth` and `storeToken` always
+use `uuid.Nil` as the user key.
+
+If no shared token exists, the proxy connects to the upstream unauthenticated. Tool listings
+may still work (catalog is populated); actual tool calls will return an auth error from the
+upstream if credentials are required.
 
 ### 5. Web UI
 
-Server-rendered HTML. Routes:
+Server-rendered HTML (`:8081`). Routes:
 
 | Route | Description |
 |---|---|
-| `GET /` | List of upstreams with auth status for the current user |
-| `GET /upstreams/new` | Add upstream form |
-| `POST /upstreams` | Create upstream; triggers discovery |
-| `GET /upstreams/{id}/authorize` | Start OAuth PKCE flow for current user |
-| `GET /oauth/callback` | OAuth callback (exchanges code, stores tokens) |
-| `GET /upstreams/{id}/edit` | Edit upstream config |
-| `DELETE /upstreams/{id}` | Delete upstream |
-| `GET /tokens` | Manage agent tokens |
-| `POST /tokens` | Create agent token |
-| `DELETE /tokens/{id}` | Revoke agent token |
-| `GET /admin/allowlist` | View current allowlist (read-only, from config file) |
+| `GET /ui/upstreams` | List upstreams with live status |
+| `GET /ui/upstreams/new` | Add upstream form |
+| `POST /ui/upstreams` | Create upstream; triggers discovery |
+| `GET /ui/upstreams/{id}` | View upstream details, tools, resources |
+| `POST /ui/upstreams/{id}/auth` | Start OAuth PKCE flow (shared authorization) |
+| `GET /oauth/callback` | OAuth callback (exchanges code, stores shared token) |
+| `POST /ui/upstreams/{id}/tools/{tool}` | Enable/disable a tool |
+| `POST /ui/upstreams/{id}/credential` | Update bearer_static token |
+| `POST /ui/upstreams/{id}/delete` | Delete upstream |
+| `GET /ui/tokens` | Manage agent tokens |
+| `POST /ui/tokens` | Create agent token |
+| `POST /ui/tokens/{id}/delete` | Revoke agent token |
 
-### 6. Web UI Authentication (OAuth2-proxy compatible)
+### 6. Web UI Authentication
 
-The proxy is designed to run behind [oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/),
-which injects user identity headers after authentication. The proxy itself has no login flow —
-it only reads what oauth2-proxy provides.
-
-Headers read (configurable):
-- `X-Auth-Request-Email` → user email
-- `X-Auth-Request-Groups` → comma-separated group list
-
-Allowlist is defined in the **config file** (not the DB), so the UI is protected before the
-database is initialized.
-
-Two auth modes:
+Two modes:
 
 | Mode | Behaviour |
 |---|---|
-| `oauth2_proxy` | Headers required; request denied (403) if absent or not in allowlist |
-| `open` | All requests allowed; intended for local dev without oauth2-proxy in front |
+| `open` | All requests allowed. For local development. |
+| `oauth2_proxy` | Must run behind [oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/). Reads `X-Auth-Request-Email` / `X-Auth-Request-Groups` headers; enforces an allowlist. |
+
+The MCP endpoint (`:8080`) is separate and always requires a Bearer agent token regardless of UI auth mode.
 
 ```yaml
 auth:
@@ -120,30 +139,15 @@ auth:
       - alice@example.com
     groups:
       - sre
-      - devops
 ```
-
-A request is allowed if the email or at least one group is in the allowlist.
-
-### 7. User Isolation
-
-Each user sees and manages only their own upstream tokens:
-- The Web UI upstream list shows authorization status **for the current logged-in user only**.
-- User A cannot read or enumerate User B's tokens.
-- User A can authorize any upstream, which creates or replaces **their own** token for it.
-- All store-layer methods take a `userID` from the request context — raw cross-user queries exist
-  only inside the refresh goroutine.
 
 ## Upstream Auth Types
 
-| Type | Credential storage | Per-user? |
+| Type | Credential storage | Shared |
 |---|---|---|
-| `none` | — | no |
-| `bearer_static` | token, encrypted global | no |
-| `api_key` | header name + value, encrypted global | no |
-| `basic_auth` | username + password, encrypted global | no |
-| `oauth2_client_credentials` | client_id + secret, encrypted global, shared token | no |
-| `oauth2_authorization_code` | access + refresh tokens, encrypted | **yes** |
+| `none` | — | yes |
+| `bearer_static` | token, encrypted | yes |
+| `oauth2_authorization_code` | access + refresh tokens, encrypted | yes — `user_id = uuid.Nil` |
 
 ## Database Schema (PostgreSQL)
 
@@ -155,32 +159,31 @@ users
   created_at    timestamptz
 
 upstreams
-  id             uuid PK
-  name           text NOT NULL
-  url            text NOT NULL
-  auth_type      text NOT NULL   -- enum: none | bearer_static | api_key | basic_auth
-                                 --       oauth2_client_credentials | oauth2_authorization_code
-  auth_endpoint  text
-  token_endpoint text
-  dcr_endpoint   text
-  created_at     timestamptz
-  updated_at     timestamptz
+  id                  uuid PK
+  name                text NOT NULL
+  url                 text NOT NULL
+  auth_type           text NOT NULL   -- none | bearer_static | oauth2_authorization_code
+  auth_endpoint       text            -- OAuth2 authorization endpoint
+  token_endpoint      text            -- OAuth2 token endpoint
+  dcr_endpoint        text            -- Dynamic Client Registration endpoint
+  client_id_meta_doc  bool            -- use client_id_metadata_document flow
+  created_at          timestamptz
+  updated_at          timestamptz
 
-upstream_credentials          -- global credentials (all non-per-user auth types)
+upstream_credentials          -- static credentials (bearer_static; DCR client_id/secret)
   id           uuid PK
   upstream_id  uuid FK → upstreams
-  data         bytea NOT NULL  -- AES-256-GCM encrypted JSON; shape depends on auth_type
+  data         bytea NOT NULL  -- AES-256-GCM encrypted
   updated_at   timestamptz
 
-upstream_user_tokens          -- per-user OAuth tokens (oauth2_authorization_code only)
+upstream_user_tokens          -- shared OAuth2 tokens (user_id always uuid.Nil)
   id              uuid PK
   upstream_id     uuid FK → upstreams
-  user_id         uuid FK → users
+  user_id         uuid NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'
   access_token    bytea NOT NULL   -- AES-256-GCM encrypted
   refresh_token   bytea            -- AES-256-GCM encrypted, nullable
   expires_at      timestamptz
   status          text NOT NULL    -- authorized | reauth_required
-  dcr_client_id   bytea            -- encrypted; stored durably against upstream restart
   updated_at      timestamptz
   UNIQUE (upstream_id, user_id)
 
@@ -188,70 +191,54 @@ agent_tokens
   id           uuid PK
   name         text NOT NULL
   token_hash   bytea NOT NULL UNIQUE  -- SHA-256 of the raw mcp_xxxx token
-  user_id      uuid FK → users
+  user_id      uuid FK → users        -- which UI user created this token
   created_at   timestamptz
   last_used_at timestamptz
+
+tool_filters
+  upstream_id  uuid FK → upstreams
+  tool_name    text NOT NULL
+  enabled      bool NOT NULL
+  PRIMARY KEY (upstream_id, tool_name)
 ```
 
-Encryption: AES-256-GCM, key from env `ENCRYPTION_KEY` (32-byte hex). Advisory lock key: `87430004`.
-
-## Configuration File
-
-```yaml
-# mcp-proxy.yaml
-
-database_url: postgres://...
-listen_addr:  ":8080"
-public_url:   https://mcp-proxy.example.com   # used as OAuth redirect_uri base
-
-auth:
-  mode: oauth2_proxy          # or "stub"
-  header_email: X-Auth-Request-Email
-  header_groups: X-Auth-Request-Groups
-  allowlist:
-    emails: []
-    groups: []
-```
-
-All fields are also settable via environment variables and CLI flags (urfave/cli v3).
+Encryption: AES-256-GCM, 32-byte key from `--encryption-key` / `MCP_PROXY_ENCRYPTION_KEY`.
+Migrations run automatically on startup with advisory lock `87430004`.
 
 ## Project Structure
 
 ```
 cmd/mcp-proxy/
-  main.go
+  main.go               Entry point, CLI flags, server wiring
 
 internal/
-  config/       CLI flags, env, config file loading
-  store/        GORM models, migrations (Postgres only, advisory lock 87430004)
-  crypto/       AES-256-GCM encrypt/decrypt helpers
-  upstream/     Upstream registry CRUD; OAuth manager (discovery, DCR, PKCE flow, refresh)
-  mcpclient/    MCP client pool; ToolCatalog; keyword search index
-  mcpserver/    MCP server for agents: virtual tools, dispatch
-  web/          Web UI HTTP handlers
-  auth/         oauth2-proxy header parsing; allowlist enforcement
+  config/               Config struct, YAML loading, validation
+  store/                PostgreSQL store, migrations (sqlc-style raw SQL)
+  crypto/               AES-256-GCM encrypt/decrypt helpers
+  upstream/             Upstream registry CRUD; OAuth manager (discovery, DCR, PKCE, refresh)
+  mcpclient/            MCP client pool; tool catalog; keyword search
+  mcpserver/            MCP server for agents: virtual tools, dispatch
+  web/                  Web UI HTTP handlers, templates, CSRF middleware
+  auth/                 oauth2-proxy header parsing; allowlist enforcement
+  telemetry/            Prometheus metrics, structured logging setup
 
-web/
-  templates/    HTML templates (server-rendered)
-  static/       CSS, JS assets
+test/e2e/               End-to-end tests (require TEST_DATABASE_URL)
 ```
 
 ## Key Dependencies
 
-| Package | Version | Purpose |
-|---|---|---|
-| `github.com/modelcontextprotocol/go-sdk` | v1.8.0 | MCP client + server |
-| `github.com/go-chi/chi/v5` | v5.x | HTTP router |
-| `gorm.io/gorm` + `gorm.io/driver/postgres` | latest | ORM + migrations |
-| `github.com/urfave/cli/v3` | v3.x | CLI flags |
-| `golang.org/x/oauth2` | latest | OAuth2 client |
-
-No SQLite — Postgres only (deployed alongside the agent in k8s).
+| Package | Purpose |
+|---|---|
+| `github.com/modelcontextprotocol/go-sdk` | MCP client + server (Streamable HTTP) |
+| `github.com/urfave/cli/v3` | CLI flags |
+| `golang.org/x/oauth2` | OAuth2 token management and refresh |
+| `github.com/google/uuid` | UUID generation and parsing |
+| `github.com/prometheus/client_golang` | Metrics |
 
 ## Deployment Notes
 
-- Runs as a single-replica Deployment in k8s (session state is in-process).
-- Requires `ENCRYPTION_KEY` env var (32-byte hex).
-- Requires `PUBLIC_URL` to match the ingress FQDN so OAuth callbacks resolve correctly.
-- Designed to run behind `oauth2-proxy` for Web UI access control.
-- The MCP endpoint (`/mcp`) is separate from the Web UI and authenticated via Bearer token only.
+- **Single replica** — session state is in-process. No distributed coordination required.
+- **Database migrations** run automatically on startup (advisory lock `87430004`).
+- **ENCRYPTION_KEY rotation** — if the key changes, all stored credentials become unreadable. Re-enter them via the UI.
+- **Public URL** must match the ingress FQDN so OAuth callbacks resolve correctly.
+- Designed to run behind a TLS-terminating reverse proxy; the proxy itself does not terminate TLS.
