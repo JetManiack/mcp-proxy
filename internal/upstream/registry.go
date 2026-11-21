@@ -78,9 +78,9 @@ func (r *Registry) StoreDiscovered(ctx context.Context, id uuid.UUID, meta *Meta
 			return fmt.Errorf("upstream: registry discover %s: %w", id, err)
 		}
 	}
-	up.AuthEndpoint    = meta.AuthorizationEndpoint
-	up.TokenEndpoint   = meta.TokenEndpoint
-	up.DCREndpoint     = meta.DCREndpoint
+	up.AuthEndpoint = meta.AuthorizationEndpoint
+	up.TokenEndpoint = meta.TokenEndpoint
+	up.DCREndpoint = meta.DCREndpoint
 	up.ClientIDMetaDoc = meta.ClientIDMetadataDocumentSupported
 	return r.store.UpdateUpstream(ctx, up)
 }
