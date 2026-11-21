@@ -158,6 +158,46 @@
 </div>
 {{end}}
 
+<script>
+document.querySelectorAll('.toggle-form').forEach(function(form) {
+  form.addEventListener('submit', function(e) {
+    e.preventDefault();
+    var btn     = form.querySelector('button.toggle');
+    var input   = form.querySelector('input[name="enabled"]');
+    var enabling = input.value === '1';
+    var nameEl  = form.closest('.tool-row').querySelector('.tool-name');
+
+    // URLSearchParams → application/x-www-form-urlencoded so r.ParseForm()
+    // in the CSRF middleware picks up csrf_token (FormData sends multipart,
+    // which ParseForm ignores, breaking CSRF validation).
+    var body = new URLSearchParams();
+    new FormData(form).forEach(function(v, k) { body.append(k, v); });
+
+    btn.disabled = true;
+    fetch(form.action, {
+      method: 'POST',
+      body: body,
+      headers: { 'Accept': 'application/json' }
+    }).then(function(res) {
+      if (!res.ok) throw new Error(res.status);
+      if (enabling) {
+        btn.classList.replace('toggle-off', 'toggle-on');
+        btn.title = 'Disable this tool';
+        input.value = '0';
+        if (nameEl) nameEl.classList.remove('tool-name-disabled');
+      } else {
+        btn.classList.replace('toggle-on', 'toggle-off');
+        btn.title = 'Enable this tool';
+        input.value = '1';
+        if (nameEl) nameEl.classList.add('tool-name-disabled');
+      }
+    }).catch(function() {
+      // Network error or non-2xx: leave the toggle as-is, nothing to revert.
+    }).finally(function() { btn.disabled = false; });
+  });
+});
+</script>
+
 <div class="card" style="margin-top:16px">
   <div class="danger-zone">
     <div class="card-label" style="margin-bottom:12px">Danger zone</div>
