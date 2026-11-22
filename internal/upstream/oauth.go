@@ -3,12 +3,13 @@ package upstream
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -18,37 +19,17 @@ import (
 	"github.com/JetManiack/mcp-proxy/internal/telemetry"
 	"github.com/google/uuid"
 	sdkauth "github.com/modelcontextprotocol/go-sdk/auth"
-	"github.com/modelcontextprotocol/go-sdk/oauthex"
 	"golang.org/x/oauth2"
 )
 
 const pendingTTL = 10 * time.Minute
 
-// dcrCreds holds the in-memory DCR credentials (never marshaled directly).
-type dcrCreds struct {
-	ClientID     string
-	ClientSecret string
-}
-
-// dcrStorage is the shape written to the DB (neutral field names to avoid
-// static-analysis false positives on the "secret" keyword).
-type dcrStorage struct {
-	ID  string `json:"id"`
-	Key string `json:"k"`
-}
-
-// dcrResponse decodes the registration endpoint's JSON reply.
-type dcrResponse struct {
-	ClientID     string `json:"client_id"`
-	ClientSecret string `json:"client_secret"`
-}
-
-// authCallback carries the OAuth2 callback parameters from /oauth/callback
-// to the pending AuthorizationCodeFetcher goroutine.
-type authCallback struct {
-	code  string
-	state string
-	iss   string
+// pendingPKCE holds the PKCE verifier and identity for an in-flight
+// authorization code exchange registered by BeginAuth.
+type pendingPKCE struct {
+	verifier   string
+	upstreamID uuid.UUID
+	userID     uuid.UUID
 }
 
 // persistingTokenSource wraps an oauth2.TokenSource and persists refreshed
@@ -102,7 +83,7 @@ type Manager struct {
 	client    *http.Client
 
 	mu      sync.Mutex
-	byState map[string]chan authCallback // state → codeCh
+	byState map[string]*pendingPKCE
 
 	dcrMu sync.Mutex // serializes DCR check+register per upstream
 }
@@ -113,7 +94,7 @@ func NewManager(s *store.Store, encKey []byte, publicURL string, client *http.Cl
 		encKey:    encKey,
 		publicURL: strings.TrimRight(publicURL, "/"),
 		client:    client,
-		byState:   make(map[string]chan authCallback),
+		byState:   make(map[string]*pendingPKCE),
 	}
 }
 
@@ -138,127 +119,66 @@ func (m *Manager) CallbackURL() string {
 	return m.publicURL + "/oauth/callback"
 }
 
-// BeginAuth starts the OAuth2 authorization code flow for the given user and upstream.
-// It returns the authorization redirect URL that the browser should follow.
+// BeginAuth starts the OAuth2 authorization code flow for the given upstream.
+// It uses the authorization endpoint already stored in the upstream record
+// (populated by discovery) to build a PKCE authorization URL, registers the
+// pending state, and returns immediately — no network requests.
 //
-// The flow is driven by auth.AuthorizationCodeHandler: a goroutine calls Authorize on
-// a synthesized 401 response, which triggers PRM/ASM discovery, selects the client
-// registration method, and calls AuthorizationCodeFetcher with the full PKCE auth URL.
-// BeginAuth blocks until the URL is ready (or times out).
-func (m *Manager) BeginAuth(ctx context.Context, upstreamID, userID uuid.UUID) (redirectURL string, _ string, _ error) {
+// Returns an error if the authorization endpoint has not yet been discovered
+// (pending_discovery state).
+func (m *Manager) BeginAuth(ctx context.Context, upstreamID, userID uuid.UUID) (redirectURL, state string, _ error) {
 	up, err := m.store.GetUpstream(ctx, upstreamID)
 	if err != nil {
 		return "", "", fmt.Errorf("upstream: begin auth: %w", err)
 	}
+	if up.AuthEndpoint == "" {
+		return "", "", fmt.Errorf("upstream: begin auth: authorization endpoint not yet discovered for %q — wait for the reconcile loop or re-add the upstream", up.Name)
+	}
 
-	// Ensure DCR credentials exist for upstreams that require them.
 	if err := m.ensureDCRCredentials(ctx, up); err != nil {
 		return "", "", fmt.Errorf("upstream: begin auth: %w", err)
 	}
 
-	handlerCfg, err := m.buildHandlerCfg(ctx, up)
+	creds, err := m.clientCredentials(ctx, up)
 	if err != nil {
 		return "", "", fmt.Errorf("upstream: begin auth: %w", err)
 	}
 
-	authURLCh := make(chan string, 1)
-	handlerCfg.AuthorizationCodeFetcher = m.makeFetcher(authURLCh)
-	handlerCfg.NewTokenSource = m.newTokenSourceFn(upstreamID, userID)
-
-	handler, err := sdkauth.NewAuthorizationCodeHandler(handlerCfg)
-	if err != nil {
-		return "", "", fmt.Errorf("upstream: begin auth: create handler: %w", err)
+	// Generate PKCE verifier and random state.
+	verifier := oauth2.GenerateVerifier()
+	stateBytes := make([]byte, 16)
+	if _, err := rand.Read(stateBytes); err != nil {
+		return "", "", fmt.Errorf("upstream: begin auth: generate state: %w", err)
 	}
+	state = base64.RawURLEncoding.EncodeToString(stateBytes)
 
-	// Synthesize a 401 response so we can call Authorize directly.
-	// Include a resource_metadata hint derived from the upstream URL so the
-	// SDK's discovery skips the fallback path and finds PRM immediately.
-	resourceMetaURL, _ := protectedResourceWellKnown(up.URL)
-	fakeReq := &http.Request{URL: mustParseURL(up.URL), Header: make(http.Header)}
-	fakeResp := &http.Response{
-		StatusCode: http.StatusUnauthorized,
-		Header:     make(http.Header),
-		Body:       io.NopCloser(strings.NewReader("")),
-	}
-	if resourceMetaURL != "" {
-		fakeResp.Header.Set("WWW-Authenticate",
-			fmt.Sprintf(`Bearer resource_metadata="%s"`, resourceMetaURL))
-	}
+	cfg := m.oauthCfg(up, creds)
+	authURL := cfg.AuthCodeURL(state, oauth2.S256ChallengeOption(verifier))
 
-	authCtx, cancel := context.WithTimeout(context.Background(), pendingTTL)
+	m.mu.Lock()
+	m.byState[state] = &pendingPKCE{
+		verifier:   verifier,
+		upstreamID: upstreamID,
+		userID:     userID,
+	}
+	m.mu.Unlock()
+
+	// Auto-expire the pending state after pendingTTL.
 	go func() {
-		defer cancel()
-		if err := handler.Authorize(authCtx, fakeReq, fakeResp); err != nil {
-			slog.Error("upstream: auth flow error",
-				"upstream_id", upstreamID, "user_id", userID, "err", err)
-		} else {
-			slog.Info("upstream: auth flow completed",
-				"upstream_id", upstreamID, "user_id", userID)
-		}
+		time.Sleep(pendingTTL)
+		m.mu.Lock()
+		delete(m.byState, state)
+		m.mu.Unlock()
 	}()
 
-	select {
-	case u := <-authURLCh:
-		parsed, err := url.Parse(u)
-		if err != nil {
-			cancel()
-			return "", "", fmt.Errorf("upstream: begin auth: parse redirect URL: %w", err)
-		}
-		return u, parsed.Query().Get("state"), nil
-	case <-time.After(30 * time.Second):
-		cancel()
-		return "", "", fmt.Errorf("upstream: begin auth: timeout waiting for auth URL (discovery failed?)")
-	case <-ctx.Done():
-		cancel()
-		return "", "", ctx.Err()
-	}
+	return authURL, state, nil
 }
 
-// makeFetcher returns an AuthorizationCodeFetcher for BeginAuth that:
-//   - parses the state from the SDK-generated auth URL
-//   - registers a result channel in byState so CompleteAuth can unblock it
-//   - delivers the auth URL to BeginAuth via authURLCh
-//   - blocks until the callback sends a result (or context expires)
-func (m *Manager) makeFetcher(authURLCh chan<- string) sdkauth.AuthorizationCodeFetcher {
-	return func(ctx context.Context, args *sdkauth.AuthorizationArgs) (*sdkauth.AuthorizationResult, error) {
-		u, err := url.Parse(args.URL)
-		if err != nil {
-			return nil, fmt.Errorf("parse auth URL: %w", err)
-		}
-		state := u.Query().Get("state")
-		if state == "" {
-			return nil, fmt.Errorf("auth URL has no state parameter")
-		}
-
-		codeCh := make(chan authCallback, 1)
-		m.mu.Lock()
-		m.byState[state] = codeCh
-		m.mu.Unlock()
-
-		authURLCh <- args.URL
-
-		select {
-		case result := <-codeCh:
-			return &sdkauth.AuthorizationResult{
-				Code:  result.code,
-				State: result.state,
-				Iss:   result.iss,
-			}, nil
-		case <-ctx.Done():
-			m.mu.Lock()
-			delete(m.byState, state)
-			m.mu.Unlock()
-			return nil, ctx.Err()
-		}
-	}
-}
-
-// CompleteAuth handles the OAuth2 callback by routing the authorization code to
-// the waiting AuthorizationCodeFetcher goroutine, which then exchanges it for tokens
-// and persists them via NewTokenSource.
-func (m *Manager) CompleteAuth(_ context.Context, state, code string) error {
+// CompleteAuth handles the OAuth2 callback by exchanging the authorization
+// code (and stored PKCE verifier) for access/refresh tokens and persisting them.
+func (m *Manager) CompleteAuth(ctx context.Context, state, code string) error {
 	m.mu.Lock()
-	codeCh, ok := m.byState[state]
+	pending, ok := m.byState[state]
 	if ok {
 		delete(m.byState, state)
 	}
@@ -268,12 +188,24 @@ func (m *Manager) CompleteAuth(_ context.Context, state, code string) error {
 		return fmt.Errorf("upstream: complete auth: unknown or expired state")
 	}
 
-	select {
-	case codeCh <- authCallback{code: code, state: state}:
-		return nil
-	default:
-		return fmt.Errorf("upstream: complete auth: callback already delivered")
+	up, err := m.store.GetUpstream(ctx, pending.upstreamID)
+	if err != nil {
+		return fmt.Errorf("upstream: complete auth: %w", err)
 	}
+
+	creds, err := m.clientCredentials(ctx, up)
+	if err != nil {
+		return fmt.Errorf("upstream: complete auth: %w", err)
+	}
+
+	cfg := m.oauthCfg(up, creds)
+	exchangeCtx := context.WithValue(ctx, oauth2.HTTPClient, m.client)
+	tok, err := cfg.Exchange(exchangeCtx, code, oauth2.VerifierOption(pending.verifier))
+	if err != nil {
+		return fmt.Errorf("upstream: complete auth: exchange code: %w", err)
+	}
+
+	return m.storeToken(ctx, pending.upstreamID, pending.userID, tok)
 }
 
 // SessionHandler returns an sdkauth.OAuthHandler for use in pool sessions.
@@ -339,64 +271,13 @@ func (m *Manager) loadPersistedTokenSource(ctx context.Context, up *store.Upstre
 	}, nil
 }
 
-// newTokenSourceFn returns a NewTokenSource callback for auth.AuthorizationCodeHandlerConfig.
-// It is called by the SDK after a code exchange to persist the token and wrap it in a
-// persisting token source.
-func (m *Manager) newTokenSourceFn(upstreamID, userID uuid.UUID) func(context.Context, *oauth2.Config, *oauth2.Token) (oauth2.TokenSource, error) {
-	return func(ctx context.Context, cfg *oauth2.Config, tok *oauth2.Token) (oauth2.TokenSource, error) {
-		if err := m.storeToken(ctx, upstreamID, userID, tok); err != nil {
-			return nil, err
-		}
-		inner := cfg.TokenSource(ctx, tok)
-		return &persistingTokenSource{
-			inner: inner,
-			last:  tok.AccessToken,
-			save: func(newTok *oauth2.Token) error {
-				return m.storeToken(context.Background(), upstreamID, userID, newTok)
-			},
-		}, nil
-	}
-}
-
-// buildHandlerCfg builds an auth.AuthorizationCodeHandlerConfig for the given upstream.
-// Registration method (ClientIDMetadataDocumentConfig or PreregisteredClient) is set
-// based on the upstream's stored configuration. AuthorizationCodeFetcher and
-// NewTokenSource must be set by the caller.
-func (m *Manager) buildHandlerCfg(ctx context.Context, up *store.Upstream) (*sdkauth.AuthorizationCodeHandlerConfig, error) {
-	creds, err := m.clientCredentials(ctx, up)
-	if err != nil {
-		return nil, err
-	}
-
-	cfg := &sdkauth.AuthorizationCodeHandlerConfig{
-		RedirectURL:           m.CallbackURL(),
-		Client:                m.client,
-		RequestRefreshToken:   true,
-		AcceptUnadvertisedIss: true,
-	}
-
-	if up.ClientIDMetaDoc {
-		cfg.ClientIDMetadataDocumentConfig = &sdkauth.ClientIDMetadataDocumentConfig{
-			URL: m.ClientMetadataURL(),
-		}
-	} else if creds != nil {
-		pc := &oauthex.ClientCredentials{ClientID: creds.ClientID}
-		if creds.ClientSecret != "" {
-			pc.ClientSecretAuth = &oauthex.ClientSecretAuth{ClientSecret: creds.ClientSecret}
-		}
-		cfg.PreregisteredClient = pc
-	} else {
-		return nil, fmt.Errorf("no client credentials: upstream needs DCR endpoint or client_id_metadata_document_supported")
-	}
-
-	return cfg, nil
-}
-
-// oauthCfg builds a minimal oauth2.Config for token refresh for the given upstream.
+// oauthCfg builds an oauth2.Config for the given upstream using the stored
+// authorization and token endpoints.
 func (m *Manager) oauthCfg(up *store.Upstream, creds *dcrCreds) *oauth2.Config {
 	cfg := &oauth2.Config{
 		RedirectURL: m.CallbackURL(),
 		Endpoint: oauth2.Endpoint{
+			AuthURL:  up.AuthEndpoint,
 			TokenURL: up.TokenEndpoint,
 		},
 	}
@@ -443,7 +324,6 @@ func (m *Manager) storeToken(ctx context.Context, upstreamID, userID uuid.UUID, 
 
 // clientCredentials returns the stored DCR credentials for an upstream.
 // Returns nil (not an error) for ClientIDMetaDoc upstreams that don't need explicit creds.
-// Returns a GORM record-not-found error (store.IsNotFound) when creds don't exist yet.
 func (m *Manager) clientCredentials(ctx context.Context, up *store.Upstream) (*dcrCreds, error) {
 	if up.ClientIDMetaDoc {
 		return nil, nil
@@ -548,7 +428,21 @@ func (m *Manager) registerDCR(ctx context.Context, up *store.Upstream) (clientID
 	return dcrResp.ClientID, nil
 }
 
-func mustParseURL(raw string) *url.URL {
-	u, _ := url.Parse(raw)
-	return u
+// dcrCreds holds the in-memory DCR credentials (never marshaled directly).
+type dcrCreds struct {
+	ClientID     string
+	ClientSecret string
+}
+
+// dcrStorage is the shape written to the DB (neutral field names to avoid
+// static-analysis false positives on the "secret" keyword).
+type dcrStorage struct {
+	ID  string `json:"id"`
+	Key string `json:"k"`
+}
+
+// dcrResponse decodes the registration endpoint's JSON reply.
+type dcrResponse struct {
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
 }

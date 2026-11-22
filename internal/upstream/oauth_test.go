@@ -170,23 +170,9 @@ func TestCompleteAuth_StoresTokens(t *testing.T) {
 		t.Fatalf("CompleteAuth: %v", err)
 	}
 
-	// The token exchange and DB write happen in a goroutine after CompleteAuth returns.
-	// Retry on record-not-found until the write lands or the deadline expires.
-	var tok *store.UpstreamUserToken
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		var err error
-		tok, err = s.GetUserToken(ctx, up.ID, user.ID)
-		if err == nil {
-			break
-		}
-		if !store.IsNotFound(err) {
-			t.Fatalf("GetUserToken after CompleteAuth: unexpected error: %v", err)
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("GetUserToken after CompleteAuth: token not stored within deadline: %v", err)
-		}
-		time.Sleep(25 * time.Millisecond)
+	tok, err := s.GetUserToken(ctx, up.ID, user.ID)
+	if err != nil {
+		t.Fatalf("GetUserToken after CompleteAuth: %v", err)
 	}
 	if tok.Status != "authorized" {
 		t.Errorf("Status: got %q, want authorized", tok.Status)
