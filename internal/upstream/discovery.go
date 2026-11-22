@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -94,7 +95,12 @@ func ProbeAuthType(ctx context.Context, client *http.Client, upstreamURL string)
 	// oauth2: run full discovery chain.
 	meta, err := discoverFromWWWAuthenticate(ctx, client, upstreamURL, wwwAuth)
 	if err != nil {
-		return nil, err
+		// Discovery failed (e.g. well-known endpoint behind an auth proxy).
+		// Create the upstream with the correct auth type but no endpoints; the
+		// reconcile loop will retry discovery and populate them when it succeeds.
+		slog.Warn("upstream: oauth2 discovery failed during probe; will retry via reconcile loop",
+			"upstream", upstreamURL, "err", err)
+		return &ProbeResult{AuthType: "oauth2_authorization_code"}, nil
 	}
 	return &ProbeResult{AuthType: "oauth2_authorization_code", Meta: meta}, nil
 }
@@ -117,52 +123,135 @@ func parseWWWAuthenticate(header string) string {
 	}
 }
 
-// discoverFromWWWAuthenticate runs the full OAuth discovery chain starting from
-// the resource_metadata URL found in the WWW-Authenticate header.
+// discoverFromWWWAuthenticate runs the full OAuth discovery chain.
+//
+// Step 1 — Protected Resource doc:
+//   - If resource_metadata was provided in WWW-Authenticate, use that URL.
+//   - Otherwise, try all RFC 9728 §5 well-known URL variants for the upstream.
+//
+// Step 2 — Authorization Server metadata:
+//   - If we got an issuer from the PR doc, generate candidates from it.
+//   - Otherwise fall back to generating candidates from the upstream URL itself.
+//   - Tries RFC 8414 (with and without path) and OpenID Connect variants.
 func discoverFromWWWAuthenticate(ctx context.Context, client *http.Client, upstreamURL, wwwAuth string) (*Meta, error) {
-	prURL, err := extractResourceMetadata(wwwAuth)
-	if err != nil {
-		// Fall back to RFC 9728 §5 path construction.
-		prURL, err = protectedResourceWellKnown(upstreamURL)
-		if err != nil {
-			return nil, fmt.Errorf("upstream: discover %s: build well-known URL: %w", upstreamURL, err)
+	// Use a redirect-limited client so a looping endpoint fails fast.
+	dc := discoveryClient(client)
+
+	// --- Step 1: protected resource doc ---
+	var issuer string
+	if prURL, err := extractResourceMetadata(wwwAuth); err == nil {
+		// resource_metadata was provided — trust it, don't fall back.
+		var pr protectedResourceDoc
+		if err := getJSON(ctx, dc, prURL, &pr); err == nil && len(pr.AuthorizationServers) > 0 {
+			issuer = pr.AuthorizationServers[0]
+		}
+	} else {
+		// No resource_metadata: try all RFC 9728 §5 well-known variants.
+		for _, prURL := range protectedResourceCandidates(upstreamURL) {
+			var pr protectedResourceDoc
+			if err := getJSON(ctx, dc, prURL, &pr); err == nil && len(pr.AuthorizationServers) > 0 {
+				issuer = pr.AuthorizationServers[0]
+				break
+			}
 		}
 	}
 
-	var pr protectedResourceDoc
-	if err := getJSON(ctx, client, prURL, &pr); err != nil {
-		return nil, fmt.Errorf("upstream: discover %s: %w", upstreamURL, err)
+	// --- Step 2: authorization server metadata ---
+	// If we didn't find an issuer from the PR doc, derive candidates from the
+	// upstream URL itself (some servers skip the PR doc layer entirely).
+	source := issuer
+	if source == "" {
+		source = upstreamURL
 	}
-	if len(pr.AuthorizationServers) == 0 {
-		return nil, fmt.Errorf("upstream: discover %s: no authorization_servers in protected resource doc", upstreamURL)
+	candidates, err := authServerMetadataCandidates(source)
+	if err != nil {
+		return nil, fmt.Errorf("upstream: discover %s: build AS metadata URLs: %w", upstreamURL, err)
 	}
 
-	asURL, err := authServerMetadataURL(pr.AuthorizationServers[0])
-	if err != nil {
-		return nil, fmt.Errorf("upstream: discover %s: build AS metadata URL: %w", upstreamURL, err)
+	var lastErr error
+	for _, asURL := range candidates {
+		var as authServerDoc
+		if err := getJSON(ctx, dc, asURL, &as); err != nil {
+			lastErr = err
+			continue
+		}
+		if as.AuthorizationEndpoint == "" && as.TokenEndpoint == "" {
+			lastErr = fmt.Errorf("HTTP 200 but no endpoints at %s", asURL)
+			continue
+		}
+		return &Meta{
+			AuthorizationEndpoint:             as.AuthorizationEndpoint,
+			TokenEndpoint:                     as.TokenEndpoint,
+			DCREndpoint:                       as.RegistrationEndpoint,
+			ClientIDMetadataDocumentSupported: as.ClientIDMetadataDocumentSupported,
+		}, nil
 	}
-	var as authServerDoc
-	if err := getJSON(ctx, client, asURL, &as); err != nil {
-		return nil, fmt.Errorf("upstream: discover auth server %s: %w", pr.AuthorizationServers[0], err)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no candidates found")
 	}
-	return &Meta{
-		AuthorizationEndpoint:             as.AuthorizationEndpoint,
-		TokenEndpoint:                     as.TokenEndpoint,
-		DCREndpoint:                       as.RegistrationEndpoint,
-		ClientIDMetadataDocumentSupported: as.ClientIDMetadataDocumentSupported,
-	}, nil
+	return nil, fmt.Errorf("upstream: discover %s: all AS metadata candidates failed: %w", upstreamURL, lastErr)
 }
 
-// authServerMetadataURL constructs the RFC 8414 §3 discovery URL for an OAuth AS.
-// Per the spec the .well-known path is always at the authority root, not under
-// the issuer's path component. For issuer https://host/path the URL is
-// https://host/.well-known/oauth-authorization-server (not /<path>/.well-known/…).
-func authServerMetadataURL(issuer string) (string, error) {
+// discoveryClient wraps base with a redirect limiter (3 hops max) so looping
+// well-known endpoints fail fast instead of spinning for 10 redirects.
+func discoveryClient(base *http.Client) *http.Client {
+	dc := *base
+	dc.CheckRedirect = func(_ *http.Request, via []*http.Request) error {
+		if len(via) >= 3 {
+			return fmt.Errorf("stopped after %d redirects", len(via))
+		}
+		return nil
+	}
+	return &dc
+}
+
+// protectedResourceCandidates returns the RFC 9728 §5 well-known URL variants
+// for a protected resource URL, tried in order when no resource_metadata hint
+// is present in the WWW-Authenticate header.
+func protectedResourceCandidates(rawURL string) []string {
+	u, err := url.Parse(strings.TrimRight(rawURL, "/"))
+	if err != nil {
+		return nil
+	}
+	base := u.Scheme + "://" + u.Host
+	var out []string
+	if u.Path != "" && u.Path != "/" {
+		// RFC 9728 §5: insert .well-known before the path.
+		out = append(out, base+"/.well-known/oauth-protected-resource"+u.Path)
+	}
+	out = append(out, base+"/.well-known/oauth-protected-resource")
+	return out
+}
+
+// authServerMetadataCandidates returns OAuth AS metadata URLs to try for a
+// given issuer, covering RFC 8414 and OpenID Connect variants.
+//
+// For issuer https://host/path the candidates are:
+//  1. https://host/.well-known/oauth-authorization-server         (RFC 8414, no path)
+//  2. https://host/.well-known/oauth-authorization-server/path    (RFC 8414, path appended)
+//  3. https://host/path/.well-known/oauth-authorization-server    (RFC 8414, path before .well-known)
+//  4. https://host/.well-known/openid-configuration               (OIDC, no path)
+//  5. https://host/path/.well-known/openid-configuration          (OIDC, Keycloak-style)
+func authServerMetadataCandidates(issuer string) ([]string, error) {
 	u, err := url.Parse(strings.TrimRight(issuer, "/"))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return u.Scheme + "://" + u.Host + "/.well-known/oauth-authorization-server", nil
+	base := u.Scheme + "://" + u.Host
+	path := u.Path
+
+	out := []string{
+		base + "/.well-known/oauth-authorization-server",
+	}
+	if path != "" && path != "/" {
+		out = append(out, base+"/.well-known/oauth-authorization-server"+path)
+		out = append(out, base+path+"/.well-known/oauth-authorization-server")
+	}
+	out = append(out, base+"/.well-known/openid-configuration")
+	if path != "" && path != "/" {
+		out = append(out, base+path+"/.well-known/openid-configuration")
+	}
+	return out, nil
 }
 
 // extractResourceMetadata parses the resource_metadata="<url>" token from a

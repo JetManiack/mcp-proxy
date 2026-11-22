@@ -74,7 +74,49 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		return nil, fmt.Errorf("store: migrate: %w", err)
 	}
 
+	if err := migrateOAuth2TokensToShared(ctx, db); err != nil {
+		return nil, fmt.Errorf("store: migrate oauth2 tokens: %w", err)
+	}
+
 	return &Store{db: db}, nil
+}
+
+// migrateOAuth2TokensToShared is a one-time idempotent migration that moves
+// per-user OAuth2 tokens to the shared uuid.Nil user key introduced when the
+// proxy switched from per-user to shared OAuth2 credentials.
+//
+// For each upstream that has non-nil user tokens but no nil-user token, the
+// most recently updated token is copied to user_id = uuid.Nil. All non-nil
+// tokens are then deleted. Running this twice is a no-op.
+func migrateOAuth2TokensToShared(ctx context.Context, db *gorm.DB) error {
+	nilUser := "00000000-0000-0000-0000-000000000000"
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Copy the most recently updated per-user token to uuid.Nil, but only
+		// for upstreams that don't already have a nil-user token.
+		if err := tx.Exec(`
+			INSERT INTO upstream_user_tokens
+				(id, upstream_id, user_id, access_token, refresh_token, expires_at, status, updated_at)
+			SELECT DISTINCT ON (upstream_id)
+				gen_random_uuid(), upstream_id, ?::uuid,
+				access_token, refresh_token, expires_at, status, now()
+			FROM upstream_user_tokens
+			WHERE user_id != ?::uuid
+			  AND upstream_id NOT IN (
+			      SELECT upstream_id FROM upstream_user_tokens WHERE user_id = ?::uuid
+			  )
+			ORDER BY upstream_id, updated_at DESC
+			ON CONFLICT (upstream_id, user_id) DO NOTHING
+		`, nilUser, nilUser, nilUser).Error; err != nil {
+			return fmt.Errorf("copy tokens to shared: %w", err)
+		}
+		// Delete all per-user tokens — they are now obsolete.
+		if err := tx.Exec(
+			`DELETE FROM upstream_user_tokens WHERE user_id != ?::uuid`, nilUser,
+		).Error; err != nil {
+			return fmt.Errorf("delete per-user tokens: %w", err)
+		}
+		return nil
+	})
 }
 
 func (s *Store) Close() error {
