@@ -83,15 +83,21 @@ func TestE2E_ToolToggle(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = sess.Close() })
 
+	// Activate "ping" as a native tool for this session before testing toggle behavior.
+	if searchRes, err := sess.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "mcp_tool_search",
+		Arguments: map[string]any{"query": "ping"},
+	}); err != nil {
+		t.Fatalf("mcp_tool_search: %v", err)
+	} else if searchRes.IsError {
+		t.Fatalf("mcp_tool_search returned error: %v", searchRes.Content)
+	}
+
 	callPing := func(t *testing.T) *mcp.CallToolResult {
 		t.Helper()
 		res, err := sess.CallTool(ctx, &mcp.CallToolParams{
-			Name: "mcp_tool_call",
-			Arguments: map[string]any{
-				"upstream_id": up.ID.String(),
-				"tool_name":   "ping",
-				"args":        map[string]any{},
-			},
+			Name:      "ping",
+			Arguments: map[string]any{},
 		})
 		if err != nil {
 			t.Fatalf("CallTool: %v", err)

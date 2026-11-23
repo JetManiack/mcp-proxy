@@ -180,21 +180,19 @@ func TestE2E_AgentTokenFullChain(t *testing.T) {
 		}
 	})
 
-	// --- sub-test: mcp_tool_call --------------------------------------------
-	t.Run("mcp_tool_call", func(t *testing.T) {
+	// --- sub-test: native_ping_call -----------------------------------------
+	// mcp_tool_search (above) activated "ping" as a native tool for this session;
+	// verify it can now be called directly without any wrapper.
+	t.Run("native_ping_call", func(t *testing.T) {
 		res, err := sess.CallTool(ctx, &mcp.CallToolParams{
-			Name: "mcp_tool_call",
-			Arguments: map[string]any{
-				"upstream_id": up.ID.String(),
-				"tool_name":   "ping",
-				"args":        map[string]any{},
-			},
+			Name:      "ping",
+			Arguments: map[string]any{},
 		})
 		if err != nil {
-			t.Fatalf("mcp_tool_call: %v", err)
+			t.Fatalf("ping (native): %v", err)
 		}
 		if res.IsError {
-			t.Fatalf("mcp_tool_call error: %v", res.Content)
+			t.Fatalf("ping (native) error: %v", res.Content)
 		}
 		text := res.Content[0].(*mcp.TextContent).Text
 		if text != "pong" {
