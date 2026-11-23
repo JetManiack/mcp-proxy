@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strings"
 	"testing"
 
 	"github.com/JetManiack/mcp-proxy/internal/mcpclient"
@@ -175,7 +174,10 @@ func TestMCPToolSearch_IncludesInputSchema(t *testing.T) {
 	}
 }
 
-func TestMCPToolCall(t *testing.T) {
+// TestNativeToolCall verifies the lazy tool activation flow:
+// 1. mcp_tool_search activates an upstream tool for the session.
+// 2. The tool is then callable by its native name without any wrapper.
+func TestNativeToolCall(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 
@@ -196,98 +198,32 @@ func TestMCPToolCall(t *testing.T) {
 	proxySrv := mcpserver.New(pool)
 	sess := connectProxyClient(t, proxySrv.Handler(), uuid.Nil)
 
-	res, err := sess.CallTool(ctx, &mcp.CallToolParams{
-		Name: "mcp_tool_call",
-		Arguments: map[string]any{
-			"upstream_id": up.ID.String(),
-			"tool_name":   "echo",
-			"args":        map[string]any{"msg": "proxy works"},
-		},
+	// Step 1: search activates the tool natively.
+	searchRes, err := sess.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "mcp_tool_search",
+		Arguments: map[string]any{"query": "echo"},
 	})
 	if err != nil {
-		t.Fatalf("mcp_tool_call: %v", err)
+		t.Fatalf("mcp_tool_search: %v", err)
+	}
+	if searchRes.IsError {
+		t.Fatalf("mcp_tool_search returned error: %v", searchRes.Content)
+	}
+
+	// Step 2: call the upstream tool by its native name.
+	res, err := sess.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "echo",
+		Arguments: map[string]any{"msg": "proxy works"},
+	})
+	if err != nil {
+		t.Fatalf("echo (native): %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("mcp_tool_call returned error: %v", res.Content)
+		t.Fatalf("echo (native) returned error: %v", res.Content)
 	}
 	text := res.Content[0].(*mcp.TextContent).Text
 	if text != "proxy works" {
-		t.Errorf("mcp_tool_call: got %q, want %q", text, "proxy works")
-	}
-}
-
-// TestMCPToolCall_ProxyToolRejected checks that calling a proxy-level tool via
-// mcp_tool_call returns a clear error instead of forwarding to an upstream.
-// This prevents agents from looping when they accidentally route proxy tools
-// through mcp_tool_call with an upstream_id.
-// No database needed: the proxy-tool guard fires before any pool/store call.
-func TestMCPToolCall_ProxyToolRejected(t *testing.T) {
-	ctx := context.Background()
-
-	pool := mcpclient.NewPool(nil, make([]byte, 32), nil, nil)
-	t.Cleanup(pool.Close)
-
-	proxySrv := mcpserver.New(pool)
-	sess := connectProxyClient(t, proxySrv.Handler(), uuid.Nil)
-
-	proxyTools := []string{
-		"upstream_status",
-		"mcp_tool_search",
-		"mcp_tool_call",
-		"mcp_resource_list",
-		"mcp_resource_read",
-	}
-	for _, toolName := range proxyTools {
-		t.Run(toolName, func(t *testing.T) {
-			res, err := sess.CallTool(ctx, &mcp.CallToolParams{
-				Name: "mcp_tool_call",
-				Arguments: map[string]any{
-					"upstream_id": uuid.New().String(),
-					"tool_name":   toolName,
-					"args":        map[string]any{},
-				},
-			})
-			if err != nil {
-				t.Fatalf("unexpected protocol error: %v", err)
-			}
-			if !res.IsError {
-				t.Fatalf("expected IsError=true for proxy tool %q routed via mcp_tool_call", toolName)
-			}
-			if len(res.Content) == 0 {
-				t.Fatal("expected non-empty error content")
-			}
-			msg := res.Content[0].(*mcp.TextContent).Text
-			// The error must guide the agent: explain this is a proxy tool and
-			// must be called directly, not routed through mcp_tool_call.
-			if !strings.Contains(msg, "proxy") {
-				t.Errorf("error message must mention 'proxy' to guide the agent; got: %q", msg)
-			}
-		})
-	}
-}
-
-func TestMCPToolCall_InvalidUpstreamID(t *testing.T) {
-	s := openTestStore(t)
-	ctx := context.Background()
-
-	pool := mcpclient.NewPool(s, make([]byte, 32), nil, nil)
-	t.Cleanup(pool.Close)
-
-	proxySrv := mcpserver.New(pool)
-	sess := connectProxyClient(t, proxySrv.Handler(), uuid.Nil)
-
-	res, err := sess.CallTool(ctx, &mcp.CallToolParams{
-		Name: "mcp_tool_call",
-		Arguments: map[string]any{
-			"upstream_id": "not-a-uuid",
-			"tool_name":   "echo",
-		},
-	})
-	if err != nil {
-		t.Fatalf("unexpected protocol error: %v", err)
-	}
-	if !res.IsError {
-		t.Fatal("expected IsError=true for invalid upstream_id")
+		t.Errorf("echo: got %q, want %q", text, "proxy works")
 	}
 }
 

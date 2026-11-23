@@ -1,10 +1,14 @@
 // Package mcpserver exposes virtual MCP tools to downstream agents.
 //
-//   - mcp_tool_search   — keyword search over all upstream tools
-//   - mcp_tool_call     — call a specific upstream tool on behalf of the caller
+// Initial tool set (all sessions):
+//   - mcp_tool_search   — keyword search; activates found tools natively for the session
 //   - upstream_status   — list connectivity/auth state for all upstreams
 //   - mcp_resource_list — list documentation resources across all upstreams
 //   - mcp_resource_read — read a documentation resource by namespaced URI
+//
+// Lazy activation: calling mcp_tool_search activates the matched upstream tools
+// as native MCP tools with their original inputSchema. Subsequent calls go
+// directly to the upstream without any wrapping.
 package mcpserver
 
 import (
@@ -14,57 +18,83 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 
 	"github.com/JetManiack/mcp-proxy/internal/mcpclient"
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Server wraps an MCP server that proxies tool calls to upstream MCP servers.
-type Server struct {
-	pool *mcpclient.Pool
-	srv  *mcp.Server
+// sessionState holds a per-session mcp.Server and the set of already-activated
+// native tool names (to avoid redundant AddTool calls).
+type sessionState struct {
+	srv            *mcp.Server
+	activatedTools map[string]bool
 }
 
-// New creates the MCP server and registers all meta-tools.
+// Server manages per-session MCP servers with lazy native-tool activation.
+type Server struct {
+	pool *mcpclient.Pool
+
+	mu       sync.Mutex
+	sessions map[string]*sessionState // sessionID → state
+}
+
+// New creates the proxy MCP server.
 func New(pool *mcpclient.Pool) *Server {
-	s := &Server{pool: pool}
-	srv := mcp.NewServer(
-		&mcp.Implementation{Name: "mcp-proxy", Version: "v0.1.0"},
-		nil,
-	)
-	mcp.AddTool(srv, toolSearch, s.handleSearch)
-	mcp.AddTool(srv, toolCall, s.handleCall)
-	mcp.AddTool(srv, toolStatus, s.handleStatus)
-	mcp.AddTool(srv, toolResourceList, s.handleResourceList)
-	mcp.AddTool(srv, toolResourceRead, s.handleResourceRead)
-	srv.AddResource(proxyGuideResource, handleProxyGuide)
-	s.srv = srv
-	return s
+	return &Server{
+		pool:     pool,
+		sessions: make(map[string]*sessionState),
+	}
 }
 
 // Handler returns an http.Handler serving the MCP protocol.
 func (s *Server) Handler() http.Handler {
-	return mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
-		return s.srv
-	}, nil)
+	return mcp.NewStreamableHTTPHandler(s.getServer, nil)
+}
+
+// getServer is called by the streamable HTTP handler once per new client
+// session. It creates a fresh mcp.Server with a predetermined session ID,
+// registers the base tools, and stores the session in the registry so the
+// mcp_tool_search handler can add native tools to it later.
+func (s *Server) getServer(_ *http.Request) *mcp.Server {
+	newID := uuid.New().String()
+
+	srv := mcp.NewServer(
+		&mcp.Implementation{Name: "mcp-proxy", Version: "v0.1.0"},
+		&mcp.ServerOptions{
+			GetSessionID: func() string { return newID },
+		},
+	)
+
+	state := &sessionState{
+		srv:            srv,
+		activatedTools: make(map[string]bool),
+	}
+
+	mcp.AddTool(srv, toolSearch, s.makeSearchHandler(newID))
+	mcp.AddTool(srv, toolStatus, s.handleStatus)
+	mcp.AddTool(srv, toolResourceList, s.handleResourceList)
+	mcp.AddTool(srv, toolResourceRead, s.handleResourceRead)
+	srv.AddResource(proxyGuideResource, handleProxyGuide)
+
+	s.mu.Lock()
+	s.sessions[newID] = state
+	s.mu.Unlock()
+
+	return srv
 }
 
 // ---- tool definitions -------------------------------------------------------
 
 var toolSearch = &mcp.Tool{
 	Name:        "mcp_tool_search",
-	Description: "Search for tools across all connected upstream MCP servers by keyword. Returns matching tool names, descriptions, and their upstream IDs.",
-}
-
-var toolCall = &mcp.Tool{
-	Name:        "mcp_tool_call",
-	Description: "Call a specific tool on a specific upstream MCP server. Use mcp_tool_search first to find the right upstream_id and tool_name.",
+	Description: "Search for tools across all connected upstream MCP servers by keyword. Activates matched tools as native MCP tools for this session — subsequent calls use the tool name directly without any wrapper.",
 }
 
 var toolStatus = &mcp.Tool{
 	Name:        "upstream_status",
-	Description: "List the connectivity and authorization status of all configured upstream MCP servers for the current user.",
+	Description: "List the connectivity and authorization status of all configured upstream MCP servers.",
 }
 
 var proxyGuideResource = &mcp.Resource{
@@ -78,32 +108,24 @@ const proxyGuideText = `# MCP Proxy — Agent Guide
 
 This proxy aggregates multiple upstream MCP servers behind a single endpoint. You authenticate once with an agent token; the proxy handles per-upstream authentication transparently.
 
-## Available tools
+## Discovering and calling tools
 
-| Tool | Purpose |
-|------|---------|
-` + "`mcp_tool_search`" + ` | Search for tools across all connected upstreams by keyword |
-` + "`mcp_tool_call`" + ` | Call a specific tool on a specific upstream |
-` + "`upstream_status`" + ` | Check connectivity and auth status of all upstreams |
-` + "`mcp_resource_list`" + ` | List all documentation resources from all upstreams |
-` + "`mcp_resource_read`" + ` | Read the content of a specific resource |
+Tools are loaded lazily per session. Use ` + "`mcp_tool_search`" + ` to discover and activate them:
 
-## Discovering and calling a tool
+1. ` + "`mcp_tool_search`" + ` with keywords → returns tool names, descriptions, and input schemas
+2. After the search, found tools appear directly in your tool list with their original JSON Schema
+3. Call the tool by its original name — no wrapper needed
 
-1. Search: ` + "`mcp_tool_search`" + ` with keywords → returns tool_name + upstream_id pairs
-2. Call: ` + "`mcp_tool_call`" + ` with the upstream_id and tool_name from step 1
-
-Example flow:
+Example:
 ` + "```" + `
-mcp_tool_search(query="execute command")
-→ [{"tool_name":"exec_command","upstream_id":"...","upstream_name":"sandbox"}]
+mcp_tool_search(query="prometheus query")
+→ [{"tool_name":"thanos_query_instant","input_schema":{"required":["query"],...}}]
 
-mcp_tool_call(upstream_id="...", tool_name="exec_command", args={"command":"echo hi"})
+thanos_query_instant(query="up{job='mcp-proxy'}")
+→ <prometheus result>
 ` + "```" + `
 
 ## Reading upstream documentation
-
-Upstreams can expose documentation as MCP resources. URIs are namespaced as ` + "`upstream_name/resource_path`" + ` to avoid conflicts.
 
 ` + "```" + `
 mcp_resource_list()
@@ -115,7 +137,7 @@ mcp_resource_read(uri="docs-server/api-reference")
 
 ## Authorization states
 
-Some upstreams require per-user OAuth2 authorization (initiated via the web UI). The ` + "`upstream_status`" + ` tool shows:
+Some upstreams require OAuth2 authorization (initiated via the web UI). The ` + "`upstream_status`" + ` tool shows:
 - **connected** — ready, tools available
 - **needs_auth** — user must authorize via the web UI
 - **pending_discovery** — OAuth endpoints being discovered (retry in ~30s)
@@ -132,7 +154,7 @@ func handleProxyGuide(_ context.Context, _ *mcp.ReadResourceRequest) (*mcp.ReadR
 
 var toolResourceList = &mcp.Tool{
 	Name:        "mcp_resource_list",
-	Description: "List all documentation resources available across all connected upstream MCP servers. Each resource has a namespaced URI of the form 'upstream_name/resource_path' (e.g. 'docs-server/api-reference'). Pass this URI to mcp_resource_read to retrieve the content.",
+	Description: "List all documentation resources available across all connected upstream MCP servers. Each resource has a namespaced URI of the form 'upstream_name/resource_path'. Pass this URI to mcp_resource_read to retrieve the content.",
 }
 
 var toolResourceRead = &mcp.Tool{
@@ -147,111 +169,120 @@ type searchArgs struct {
 	MaxResults *int   `json:"max_results,omitempty" jsonschema:"Maximum number of results to return (default 20)"`
 }
 
-type callArgs struct {
-	UpstreamID string         `json:"upstream_id" jsonschema:"UUID of the upstream MCP server (from mcp_tool_search)"`
-	ToolName   string         `json:"tool_name"   jsonschema:"Name of the tool to call"`
-	Args       map[string]any `json:"args"        jsonschema:"Arguments to pass to the tool"`
-}
-
 type statusArgs struct{}
 
-func (s *Server) handleSearch(ctx context.Context, _ *mcp.CallToolRequest, args searchArgs) (*mcp.CallToolResult, any, error) {
-	max := 20
-	if args.MaxResults != nil && *args.MaxResults > 0 {
-		max = *args.MaxResults
-	}
+// makeSearchHandler returns the mcp_tool_search handler bound to sessionID.
+// When called, it searches the catalog, activates newly found tools as native
+// MCP tools in the session's server (triggering tools/list_changed), and
+// returns the full search results so the agent knows what is now available.
+func (s *Server) makeSearchHandler(sessionID string) func(context.Context, *mcp.CallToolRequest, searchArgs) (*mcp.CallToolResult, any, error) {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, args searchArgs) (*mcp.CallToolResult, any, error) {
+		max := 20
+		if args.MaxResults != nil && *args.MaxResults > 0 {
+			max = *args.MaxResults
+		}
 
-	cat, err := s.pool.GetCatalog(ctx)
-	if err != nil {
-		return nil, nil, fmt.Errorf("mcp_tool_search: get catalog: %w", err)
-	}
+		cat, err := s.pool.GetCatalog(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("mcp_tool_search: get catalog: %w", err)
+		}
 
-	entries := cat.Search(args.Query, max)
+		entries := cat.Search(args.Query, max)
 
-	type result struct {
-		ToolName     string          `json:"tool_name"`
-		Description  string          `json:"description"`
-		UpstreamID   string          `json:"upstream_id"`
-		UpstreamName string          `json:"upstream_name"`
-		InputSchema  json.RawMessage `json:"input_schema,omitempty"`
-	}
-	out := make([]result, 0, len(entries))
-	for _, e := range entries {
-		var schema json.RawMessage
-		if e.Tool.InputSchema != nil {
-			if b, err := json.Marshal(e.Tool.InputSchema); err != nil {
-				slog.Warn("mcp_tool_search: marshal input_schema", "tool", e.Tool.Name, "err", err)
-			} else {
-				schema = b
+		// Determine which tools are newly found (not yet activated in this session).
+		s.mu.Lock()
+		state, ok := s.sessions[sessionID]
+		toActivate := make([]*mcpclient.CatalogEntry, 0, len(entries))
+		if ok {
+			for _, e := range entries {
+				if !state.activatedTools[e.Tool.Name] {
+					state.activatedTools[e.Tool.Name] = true
+					toActivate = append(toActivate, e)
+				}
 			}
 		}
-		out = append(out, result{
-			ToolName:     e.Tool.Name,
-			Description:  e.Tool.Description,
-			UpstreamID:   e.UpstreamID.String(),
-			UpstreamName: e.UpstreamName,
-			InputSchema:  schema,
-		})
-	}
+		s.mu.Unlock()
 
-	b, _ := json.Marshal(out)
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
-	}, nil, nil
+		// Add native tools outside the lock. mcp.AddTool sends
+		// notifications/tools/list_changed to the session automatically.
+		if ok {
+			for _, e := range toActivate {
+				upstreamID := e.UpstreamID
+				toolName := e.Tool.Name
+				nativeTool := &mcp.Tool{
+					Name:        e.Tool.Name,
+					Description: e.Tool.Description,
+					InputSchema: e.Tool.InputSchema,
+				}
+				mcp.AddTool(state.srv, nativeTool,
+					func(ctx context.Context, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+						return s.callUpstreamTool(ctx, upstreamID, toolName, args)
+					},
+				)
+			}
+			if len(toActivate) > 0 {
+				slog.Debug("mcpserver: activated native tools",
+					"session", sessionID, "count", len(toActivate))
+			}
+		}
+
+		// Build response with tool metadata for the agent.
+		type result struct {
+			ToolName     string          `json:"tool_name"`
+			Description  string          `json:"description"`
+			UpstreamID   string          `json:"upstream_id"`
+			UpstreamName string          `json:"upstream_name"`
+			InputSchema  json.RawMessage `json:"input_schema,omitempty"`
+		}
+		out := make([]result, 0, len(entries))
+		for _, e := range entries {
+			var schema json.RawMessage
+			if e.Tool.InputSchema != nil {
+				if b, err := json.Marshal(e.Tool.InputSchema); err == nil {
+					schema = b
+				} else {
+					slog.Warn("mcp_tool_search: marshal input_schema", "tool", e.Tool.Name, "err", err)
+				}
+			}
+			out = append(out, result{
+				ToolName:     e.Tool.Name,
+				Description:  e.Tool.Description,
+				UpstreamID:   e.UpstreamID.String(),
+				UpstreamName: e.UpstreamName,
+				InputSchema:  schema,
+			})
+		}
+
+		b, _ := json.Marshal(out)
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
+		}, nil, nil
+	}
 }
 
-// proxyToolNames lists tools provided by the proxy itself. Routing them through
-// mcp_tool_call to an upstream is always wrong; return a clear error so agents
-// don't loop on "unknown tool" responses.
-var proxyToolNames = map[string]bool{
-	"mcp_tool_search":   true,
-	"mcp_tool_call":     true,
-	"upstream_status":   true,
-	"mcp_resource_list": true,
-	"mcp_resource_read": true,
-}
-
-func (s *Server) handleCall(ctx context.Context, req *mcp.CallToolRequest, args callArgs) (*mcp.CallToolResult, any, error) {
-	if args.ToolName == "" {
-		return errorResult("tool_name is required"), nil, nil
-	}
-
-	if proxyToolNames[args.ToolName] {
-		return errorResult(fmt.Sprintf(
-			"%q is a proxy-level tool; call it directly without upstream_id (do not route it through mcp_tool_call)",
-			args.ToolName,
-		)), nil, nil
-	}
-
-	if args.UpstreamID == "" {
-		return errorResult("upstream_id is required"), nil, nil
-	}
-
-	upstreamID, err := uuid.Parse(args.UpstreamID)
+// callUpstreamTool proxies a native tool call to the upstream. Called by
+// handlers installed via mcp.AddTool for each lazily activated tool.
+func (s *Server) callUpstreamTool(ctx context.Context, upstreamID uuid.UUID, toolName string, args map[string]any) (*mcp.CallToolResult, any, error) {
+	userID := userIDFromContext(ctx)
+	res, err := s.pool.CallTool(ctx, userID, upstreamID, toolName, args)
 	if err != nil {
-		return errorResult(fmt.Sprintf("invalid upstream_id: %v", err)), nil, nil
-	}
-
-	userID := userIDFromContext(ctx, req)
-
-	res, err := s.pool.CallTool(ctx, userID, upstreamID, args.ToolName, args.Args)
-	if err != nil {
-		slog.Warn("mcp_tool_call failed", "upstream_id", upstreamID, "tool", args.ToolName, "err", err)
+		slog.Warn("mcpserver: upstream tool call failed",
+			"upstream_id", upstreamID, "tool", toolName, "err", err)
 		switch {
-		case errors.Is(err, mcpclient.ErrUpstreamNotFound):
-			return errorResult(fmt.Sprintf(
-				"upstream_id %q not found; call upstream_status to list valid upstream IDs",
-				args.UpstreamID,
-			)), nil, nil
 		case errors.Is(err, mcpclient.ErrToolDisabled):
 			return errorResult(fmt.Sprintf(
-				"tool %q is disabled on this upstream; it was turned off via the admin UI",
-				args.ToolName,
+				"tool %q is disabled; it was turned off via the admin UI",
+				toolName,
 			)), nil, nil
 		case errors.Is(err, mcpclient.ErrUpstreamUnreachable):
 			return errorResult(fmt.Sprintf(
-				"upstream %q is unreachable; call upstream_status to check authorization state",
-				args.UpstreamID,
+				"upstream %s is unreachable; call upstream_status to check authorization state",
+				upstreamID,
+			)), nil, nil
+		case errors.Is(err, mcpclient.ErrUpstreamNotFound):
+			return errorResult(fmt.Sprintf(
+				"upstream %s not found",
+				upstreamID,
 			)), nil, nil
 		}
 		return errorResult(err.Error()), nil, nil
@@ -260,7 +291,7 @@ func (s *Server) handleCall(ctx context.Context, req *mcp.CallToolRequest, args 
 }
 
 func (s *Server) handleStatus(ctx context.Context, req *mcp.CallToolRequest, _ statusArgs) (*mcp.CallToolResult, any, error) {
-	userID := userIDFromContext(ctx, req)
+	userID := userIDFromContext(ctx)
 
 	statuses, err := s.pool.UpstreamStatuses(ctx, userID)
 	if err != nil {
@@ -298,7 +329,7 @@ type resourceReadArgs struct {
 }
 
 func (s *Server) handleResourceList(ctx context.Context, req *mcp.CallToolRequest, _ resourceListArgs) (*mcp.CallToolResult, any, error) {
-	userID := userIDFromContext(ctx, req)
+	userID := userIDFromContext(ctx)
 
 	resources, err := s.pool.ListAllResources(ctx, userID)
 	if err != nil {
@@ -334,9 +365,8 @@ func (s *Server) handleResourceRead(ctx context.Context, req *mcp.CallToolReques
 		return errorResult("uri is required"), nil, nil
 	}
 
-	userID := userIDFromContext(ctx, req)
+	userID := userIDFromContext(ctx)
 
-	// Resolve namespaced URI → upstream ID + original URI.
 	resources, err := s.pool.ListAllResources(ctx, userID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("mcp_resource_read: list resources: %w", err)
@@ -392,9 +422,8 @@ func WithUserID(ctx context.Context, userID uuid.UUID) context.Context {
 }
 
 // userIDFromContext extracts the caller's user UUID injected by the HTTP
-// middleware. Falls back to uuid.Nil when not set (e.g. in unit tests),
-// which causes the pool to use the shared (non-per-user) session.
-func userIDFromContext(ctx context.Context, _ *mcp.CallToolRequest) uuid.UUID {
+// middleware. Falls back to uuid.Nil when not set (e.g. in unit tests).
+func userIDFromContext(ctx context.Context) uuid.UUID {
 	if uid, ok := ctx.Value(contextKeyUserID{}).(uuid.UUID); ok {
 		return uid
 	}
