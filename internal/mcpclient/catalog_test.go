@@ -109,3 +109,34 @@ func TestCatalogSearch_EmptyCatalog(t *testing.T) {
 		t.Fatalf("empty catalog: want 0, got %d", len(got))
 	}
 }
+
+func TestCatalogSearch_RankingNameBeatsDescription(t *testing.T) {
+	entries := []*mcpclient.CatalogEntry{
+		// "query" appears only in description
+		{Tool: &mcp.Tool{Name: "search_issues", Description: "query issues by filter"}, UpstreamName: "tracker", UpstreamID: uuid.New()},
+		// "query" appears in name — should rank higher
+		{Tool: &mcp.Tool{Name: "query_logs", Description: "retrieve log entries"}, UpstreamName: "logs", UpstreamID: uuid.New()},
+	}
+	cat := mcpclient.NewCatalog(entries)
+	got := cat.Search("query", 0)
+	if len(got) != 2 {
+		t.Fatalf("want 2 results, got %d", len(got))
+	}
+	if got[0].Tool.Name != "query_logs" {
+		t.Errorf("name match should rank above description match; got first=%q", got[0].Tool.Name)
+	}
+}
+
+func TestCatalogSearch_TokenizesUnderscore(t *testing.T) {
+	entries := []*mcpclient.CatalogEntry{
+		{Tool: &mcp.Tool{Name: "thanos_query_instant", Description: "PromQL instant query"}, UpstreamName: "thanos", UpstreamID: uuid.New()},
+	}
+	cat := mcpclient.NewCatalog(entries)
+	// Each sub-token of the name should match independently.
+	for _, q := range []string{"thanos", "query", "instant"} {
+		got := cat.Search(q, 0)
+		if len(got) != 1 {
+			t.Errorf("query %q: want 1, got %d", q, len(got))
+		}
+	}
+}
