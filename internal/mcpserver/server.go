@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/JetManiack/mcp-proxy/internal/mcpclient"
 	"github.com/google/uuid"
@@ -82,7 +83,45 @@ func (s *Server) getServer(_ *http.Request) *mcp.Server {
 	s.sessions[newID] = state
 	s.mu.Unlock()
 
+	go s.watchSession(newID, srv)
+
 	return srv
+}
+
+// watchSession removes the session state from the registry once the client
+// disconnects. It polls srv.Sessions() every 30 seconds:
+//   - once a client connects (everConnected=true) and then goes away → clean up
+//   - if no client ever connects within 5 minutes → clean up (aborted connect)
+func (s *Server) watchSession(id string, srv *mcp.Server) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	created := time.Now()
+	everConnected := false
+
+	for range ticker.C {
+		hasActive := false
+		for range srv.Sessions() {
+			hasActive = true
+			break
+		}
+		switch {
+		case hasActive:
+			everConnected = true
+		case everConnected:
+			s.mu.Lock()
+			delete(s.sessions, id)
+			s.mu.Unlock()
+			slog.Debug("mcpserver: session cleaned up", "session", id)
+			return
+		case time.Since(created) > 5*time.Minute:
+			s.mu.Lock()
+			delete(s.sessions, id)
+			s.mu.Unlock()
+			slog.Debug("mcpserver: session cleaned up (never connected)", "session", id)
+			return
+		}
+	}
 }
 
 // ---- tool definitions -------------------------------------------------------
