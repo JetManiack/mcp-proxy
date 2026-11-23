@@ -29,8 +29,8 @@ func (c *Catalog) All() []*CatalogEntry {
 	return c.entries
 }
 
-// Search returns entries whose tool name or description contains all whitespace-
-// separated keywords in query (case-insensitive AND match).
+// Search returns entries that match any whitespace-separated keyword in query
+// (case-insensitive OR match across tool name, description, and upstream name).
 // If maxResults > 0, at most that many entries are returned.
 // An empty query returns all entries (up to maxResults).
 func (c *Catalog) Search(query string, maxResults int) []*CatalogEntry {
@@ -38,7 +38,7 @@ func (c *Catalog) Search(query string, maxResults int) []*CatalogEntry {
 
 	var results []*CatalogEntry
 	for _, e := range c.entries {
-		if matchAll(e, keywords) {
+		if matchAny(e, keywords) {
 			results = append(results, e)
 			if maxResults > 0 && len(results) >= maxResults {
 				break
@@ -48,15 +48,15 @@ func (c *Catalog) Search(query string, maxResults int) []*CatalogEntry {
 	return results
 }
 
-func matchAll(e *CatalogEntry, keywords []string) bool {
+func matchAny(e *CatalogEntry, keywords []string) bool {
 	if len(keywords) == 0 {
 		return true
 	}
-	hay := strings.ToLower(e.Tool.Name + " " + e.Tool.Description)
+	hay := strings.ToLower(e.Tool.Name + " " + e.Tool.Description + " " + e.UpstreamName)
 	for _, kw := range keywords {
-		if !strings.Contains(hay, kw) {
-			return false
+		if strings.Contains(hay, kw) {
+			return true
 		}
 	}
-	return true
+	return false
 }
