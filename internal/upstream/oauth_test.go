@@ -187,6 +187,115 @@ func TestCompleteAuth_StoresTokens(t *testing.T) {
 	}
 }
 
+func TestProactiveRefresh_UpdatesToken(t *testing.T) {
+	s := openOAuthTestStore(t)
+	ctx := context.Background()
+
+	refreshed := make(chan struct{}, 1)
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err == nil && r.FormValue("grant_type") == "refresh_token" {
+			select {
+			case refreshed <- struct{}{}:
+			default:
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		exp := time.Now().Add(time.Hour).Unix()
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "refreshed-access-token",
+			"refresh_token": "new-refresh-token",
+			"token_type":    "Bearer",
+			"expires_in":    3600,
+			"expires_at":    exp,
+		})
+	})
+	srv = httptest.NewTLSServer(mux)
+	defer srv.Close()
+
+	up := &store.Upstream{
+		Name:          "proactive-" + uuid.New().String()[:8],
+		URL:           srv.URL,
+		AuthType:      "oauth2_authorization_code",
+		AuthEndpoint:  srv.URL + "/authorize",
+		TokenEndpoint: srv.URL + "/token",
+		DCREndpoint:   srv.URL + "/register",
+	}
+	if err := s.CreateUpstream(ctx, up); err != nil {
+		t.Fatalf("CreateUpstream: %v", err)
+	}
+	defer func() { _ = s.DeleteUpstream(ctx, up.ID) }()
+
+	mgr := upstream.NewManager(s, testEncKey, "https://proxy.example.com", srv.Client())
+
+	// Store a nearly-expired token with a refresh_token directly.
+	if err := mgr.StoreTestToken(ctx, up.ID, "old-access-token", "old-refresh-token", time.Now().Add(2*time.Minute)); err != nil {
+		t.Fatalf("StoreTestToken: %v", err)
+	}
+
+	mgr.ProactiveRefresh(ctx)
+
+	select {
+	case <-refreshed:
+	default:
+		t.Fatal("expected token endpoint to be called with grant_type=refresh_token")
+	}
+
+	tok, err := s.GetUserToken(ctx, up.ID, uuid.Nil)
+	if err != nil {
+		t.Fatalf("GetUserToken: %v", err)
+	}
+	if tok.Status != "authorized" {
+		t.Errorf("status: got %q, want authorized", tok.Status)
+	}
+}
+
+func TestProactiveRefresh_SkipsNoRefreshToken(t *testing.T) {
+	s := openOAuthTestStore(t)
+	ctx := context.Background()
+
+	called := make(chan struct{}, 1)
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/token", func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case called <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv = httptest.NewTLSServer(mux)
+	defer srv.Close()
+
+	up := &store.Upstream{
+		Name:          "nort-" + uuid.New().String()[:8],
+		URL:           srv.URL,
+		AuthType:      "oauth2_authorization_code",
+		AuthEndpoint:  srv.URL + "/authorize",
+		TokenEndpoint: srv.URL + "/token",
+	}
+	if err := s.CreateUpstream(ctx, up); err != nil {
+		t.Fatalf("CreateUpstream: %v", err)
+	}
+	defer func() { _ = s.DeleteUpstream(ctx, up.ID) }()
+
+	mgr := upstream.NewManager(s, testEncKey, "https://proxy.example.com", srv.Client())
+
+	// Store a nearly-expired token WITHOUT a refresh_token.
+	if err := mgr.StoreTestToken(ctx, up.ID, "old-access-token", "", time.Now().Add(2*time.Minute)); err != nil {
+		t.Fatalf("StoreTestToken: %v", err)
+	}
+
+	mgr.ProactiveRefresh(ctx)
+
+	select {
+	case <-called:
+		t.Fatal("token endpoint must not be called when no refresh_token is stored")
+	default:
+	}
+}
+
 func TestCompleteAuth_ExpiredState(t *testing.T) {
 	s := openOAuthTestStore(t)
 	ctx := context.Background()

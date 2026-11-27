@@ -77,6 +77,66 @@ func (h *tokenSourceHandler) Authorize(_ context.Context, _ *http.Request, resp 
 	return fmt.Errorf("authorization required (HTTP %d): use the web UI to re-authenticate", resp.StatusCode)
 }
 
+// ProactiveRefresh refreshes any OAuth tokens expiring within the next
+// 5 minutes. Tokens without a refresh_token are silently skipped — the
+// user must re-authenticate via the web UI when their token eventually
+// expires. Refreshed tokens are persisted to the DB automatically so the
+// pool reconnects with fresh credentials on the same reconcile cycle.
+func (m *Manager) ProactiveRefresh(ctx context.Context) {
+	tokens, err := m.store.ListTokensNeedingRefresh(ctx)
+	if err != nil {
+		slog.Error("upstream: proactive refresh: list tokens", "err", err)
+		return
+	}
+	for _, tok := range tokens {
+		up, err := m.store.GetUpstream(ctx, tok.UpstreamID)
+		if err != nil {
+			continue
+		}
+		if len(tok.RefreshToken) == 0 {
+			continue // no refresh token: nothing to do proactively
+		}
+		m.refreshOne(ctx, up, tok)
+	}
+}
+
+func (m *Manager) refreshOne(ctx context.Context, up *store.Upstream, stored *store.UpstreamUserToken) {
+	access, err := crypto.Decrypt(m.encKey, stored.AccessToken)
+	if err != nil {
+		return
+	}
+	refresh, err := crypto.Decrypt(m.encKey, stored.RefreshToken)
+	if err != nil {
+		return
+	}
+	creds, err := m.clientCredentials(ctx, up)
+	if err != nil {
+		slog.Warn("upstream: proactive refresh: client credentials", "upstream", up.Name, "err", err)
+		return
+	}
+	cfg := m.oauthCfg(up, creds)
+	// Set Expiry to the past so oauth2.ReuseTokenSource treats the token as
+	// expired and uses the refresh_token to obtain a new access token.
+	expired := &oauth2.Token{
+		AccessToken:  string(access),
+		RefreshToken: string(refresh),
+		Expiry:       time.Now().Add(-time.Second),
+	}
+	refreshCtx := context.WithValue(ctx, oauth2.HTTPClient, m.client)
+	newTok, err := cfg.TokenSource(refreshCtx, expired).Token()
+	if err != nil {
+		slog.Warn("upstream: proactive refresh: failed", "upstream", up.Name, "err", err)
+		telemetry.TokenRefreshes.WithLabelValues(up.Name, "error").Inc()
+		return
+	}
+	if err := m.storeToken(ctx, up.ID, stored.UserID, newTok); err != nil {
+		slog.Warn("upstream: proactive refresh: store token", "upstream", up.Name, "err", err)
+		return
+	}
+	slog.Info("upstream: proactive refresh: token refreshed", "upstream", up.Name)
+	telemetry.TokenRefreshes.WithLabelValues(up.Name, "ok").Inc()
+}
+
 // Manager handles the OAuth2 authorization flow for upstreams.
 type Manager struct {
 	store     *store.Store
