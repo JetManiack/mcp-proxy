@@ -73,6 +73,9 @@ type Discoverer interface {
 // OAuthManager provides OAuth2 session handlers for the pool.
 type OAuthManager interface {
 	SessionHandler(ctx context.Context, up *store.Upstream, userID uuid.UUID) (sdkauth.OAuthHandler, error)
+	// ProactiveRefresh refreshes tokens that are expiring soon so sessions can
+	// reconnect with fresh credentials within the same reconcile cycle.
+	ProactiveRefresh(ctx context.Context)
 }
 
 // Pool manages MCP client sessions for all configured upstreams.
@@ -140,6 +143,13 @@ func (p *Pool) StartReconcileLoop(ctx context.Context, discoverer Discoverer) {
 }
 
 func (p *Pool) reconcile(ctx context.Context, discoverer Discoverer) {
+	// Refresh tokens expiring within the next 5 minutes before we attempt to
+	// connect or rebuild the catalog, so sessions created this cycle use fresh
+	// credentials instead of expired ones.
+	if p.manager != nil {
+		p.manager.ProactiveRefresh(ctx)
+	}
+
 	upstreams, err := p.store.ListUpstreams(ctx)
 	if err != nil {
 		slog.Error("mcpclient: reconcile: list upstreams", "err", err)
