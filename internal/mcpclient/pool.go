@@ -198,6 +198,7 @@ func (p *Pool) refreshCatalog(ctx context.Context) {
 		for tool, err := range sess.Tools(ctx, nil) {
 			if err != nil {
 				slog.Warn("mcpclient: refreshCatalog: tools listing error", "upstream", up.Name, "err", err)
+				p.invalidate(up.ID, uuid.Nil)
 				break
 			}
 			if enabled, ok := filters[tool.Name]; ok && !enabled {

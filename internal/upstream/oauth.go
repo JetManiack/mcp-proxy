@@ -70,9 +70,11 @@ func (h *tokenSourceHandler) TokenSource(_ context.Context) (oauth2.TokenSource,
 }
 
 func (h *tokenSourceHandler) Authorize(_ context.Context, _ *http.Request, resp *http.Response) error {
+	slog.Warn("upstream: auth challenge received", "status", resp.StatusCode,
+		"hint", "token may have expired — re-authenticate via the web UI")
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
-	return fmt.Errorf("authorization required: use the web UI to re-authenticate")
+	return fmt.Errorf("authorization required (HTTP %d): use the web UI to re-authenticate", resp.StatusCode)
 }
 
 // Manager handles the OAuth2 authorization flow for upstreams.
